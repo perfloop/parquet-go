@@ -1,8 +1,39 @@
 package variant
 
 import (
+	"fmt"
 	"testing"
 )
+
+func (e *encoder) assertSliceContiguous(positions []elementPos) {
+	if len(positions) == 0 {
+		return
+	}
+	firstStart := positions[0].start
+	if firstStart > len(e.scratch) {
+		panic(fmt.Sprintf("invariant violation: firstStart %d > len(scratch) %d", firstStart, len(e.scratch)))
+	}
+	for i := 1; i < len(positions); i++ {
+		if positions[i].start != positions[i-1].end {
+			panic(fmt.Sprintf("invariant violation: non-contiguous siblings at index %d: start %d != prior end %d", i, positions[i].start, positions[i-1].end))
+		}
+	}
+}
+
+func (e *encoder) assertObjectContiguous(entries []encodedField) {
+	if len(entries) == 0 {
+		return
+	}
+	firstStart := entries[0].start
+	if firstStart > len(e.scratch) {
+		panic(fmt.Sprintf("invariant violation: firstStart %d > len(scratch) %d", firstStart, len(e.scratch)))
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i].start != entries[i-1].end {
+			panic(fmt.Sprintf("invariant violation: non-contiguous siblings at index %d: start %d != prior end %d", i, entries[i].start, entries[i-1].end))
+		}
+	}
+}
 
 func TestInvariantViolationPanic(t *testing.T) {
 	defer func() {

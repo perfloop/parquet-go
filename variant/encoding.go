@@ -51,36 +51,6 @@ type elementPos struct {
 	end   int
 }
 
-func (e *encoder) assertSliceContiguous(positions []elementPos) {
-	if len(positions) == 0 {
-		return
-	}
-	firstStart := positions[0].start
-	if firstStart > len(e.scratch) {
-		panic(fmt.Sprintf("invariant violation: firstStart %d > len(scratch) %d", firstStart, len(e.scratch)))
-	}
-	for i := 1; i < len(positions); i++ {
-		if positions[i].start != positions[i-1].end {
-			panic(fmt.Sprintf("invariant violation: non-contiguous siblings at index %d: start %d != prior end %d", i, positions[i].start, positions[i-1].end))
-		}
-	}
-}
-
-func (e *encoder) assertObjectContiguous(entries []encodedField) {
-	if len(entries) == 0 {
-		return
-	}
-	firstStart := entries[0].start
-	if firstStart > len(e.scratch) {
-		panic(fmt.Sprintf("invariant violation: firstStart %d > len(scratch) %d", firstStart, len(e.scratch)))
-	}
-	for i := 1; i < len(entries); i++ {
-		if entries[i].start != entries[i-1].end {
-			panic(fmt.Sprintf("invariant violation: non-contiguous siblings at index %d: start %d != prior end %d", i, entries[i].start, entries[i-1].end))
-		}
-	}
-}
-
 func (e *encoder) encodeValue(v Value) (start, end int, err error) {
 	switch v.basic {
 	case BasicObject:
@@ -179,11 +149,6 @@ func (e *encoder) encodeReflect(rv reflect.Value) (start, end int, err error) {
 		rv = rv.Elem()
 	}
 
-	// Check if the value is a variant.Value directly
-	if rv.Type() == reflect.TypeFor[Value]() {
-		return e.encodeValue(rv.Interface().(Value))
-	}
-
 	// Check concrete types first
 	if rv.Type() == reflect.TypeFor[uuid.UUID]() {
 		start, end = e.encodeValuePrimitive(UUID(rv.Interface().(uuid.UUID)))
@@ -276,84 +241,13 @@ func (e *encoder) encodeSliceArray(rv reflect.Value) (start, end int, err error)
 		positions[i] = elementPos{start: pStart, end: pEnd}
 	}
 
-	e.assertSliceContiguous(positions)
-
-	totalSize := 0
-	for _, pos := range positions {
-		totalSize += pos.end - pos.start
-	}
-
-	offsets := make([]int, n+1)
-	off := 0
-	for i, pos := range positions {
-		offsets[i] = off
-		off += pos.end - pos.start
-	}
-	offsets[n] = off
-
-	offsetSzCode := offsetSizeCode(totalSize)
-	offsetSz := offsetSize(offsetSzCode)
-
-	isLarge := byte(0)
-	numElemSize := 1
-	if n > 255 {
-		isLarge = 1
-		numElemSize = 4
-	}
-
-	header := byte(BasicArray) | (offsetSzCode << 2) | (isLarge << 4)
-
-	bufSize := 1 + numElemSize + (n+1)*offsetSz + totalSize
-	buf := make([]byte, bufSize)
-	buf[0] = header
-
-	posIdx := 1
-	if isLarge == 1 {
-		binary.LittleEndian.PutUint32(buf[posIdx:], uint32(n))
-		posIdx += 4
-	} else {
-		buf[posIdx] = byte(n)
-		posIdx += 1
-	}
-
-	for _, o := range offsets {
-		writeUint(buf[posIdx:], o, offsetSz)
-		posIdx += offsetSz
-	}
-
-	for _, p := range positions {
-		copy(buf[posIdx:], e.scratch[p.start:p.end])
-		posIdx += p.end - p.start
-	}
-
-	firstStart := positions[0].start
-	e.scratch = e.scratch[:firstStart]
-
-	start = len(e.scratch)
-	e.scratch = append(e.scratch, buf...)
-	end = len(e.scratch)
-
-	return start, end, nil
+	return e.buildArrayBytes(positions)
 }
 
 func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
 	n := len(arr.Elements)
 	if n == 0 {
-		isLarge := byte(0)
-		numElemSize := 1
-		offsetSzCode := offsetSizeCode(0)
-		offsetSz := offsetSize(offsetSzCode)
-		header := byte(BasicArray) | (offsetSzCode << 2) | (isLarge << 4)
-		bufSize := 1 + numElemSize + (n+1)*offsetSz
-		buf := make([]byte, bufSize)
-		buf[0] = header
-		buf[1] = 0
-		writeUint(buf[2:], 0, offsetSz)
-
-		start = len(e.scratch)
-		e.scratch = append(e.scratch, buf...)
-		end = len(e.scratch)
-		return start, end, nil
+		return e.buildArrayBytes(nil)
 	}
 
 	var posBuf [32]elementPos
@@ -372,7 +266,11 @@ func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
 		positions[i] = elementPos{start: pStart, end: pEnd}
 	}
 
-	e.assertSliceContiguous(positions)
+	return e.buildArrayBytes(positions)
+}
+
+func (e *encoder) buildArrayBytes(positions []elementPos) (start, end int, err error) {
+	n := len(positions)
 
 	totalSize := 0
 	for _, pos := range positions {
@@ -422,7 +320,10 @@ func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
 		posIdx += p.end - p.start
 	}
 
-	firstStart := positions[0].start
+	firstStart := len(e.scratch)
+	if n > 0 {
+		firstStart = positions[0].start
+	}
 	e.scratch = e.scratch[:firstStart]
 
 	start = len(e.scratch)
@@ -440,7 +341,7 @@ func (e *encoder) encodeMapObject(rv reflect.Value) (start, end int, err error) 
 
 	n := rv.Len()
 	if n == 0 {
-		return e.encodeValueObject(Object{})
+		return e.buildObjectBytes(nil)
 	}
 
 	var entriesBuf [16]encodedField
@@ -474,8 +375,6 @@ func (e *encoder) encodeMapObject(rv reflect.Value) (start, end int, err error) 
 		idx++
 	}
 
-	e.assertObjectContiguous(entries)
-
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].name < entries[j].name
 	})
@@ -501,7 +400,7 @@ func (e *encoder) encodeStructObject(rv reflect.Value) (start, end int, err erro
 	}
 
 	if visibleCount == 0 {
-		return e.encodeValueObject(Object{})
+		return e.buildObjectBytes(nil)
 	}
 
 	var entriesBuf [16]encodedField
@@ -537,8 +436,6 @@ func (e *encoder) encodeStructObject(rv reflect.Value) (start, end int, err erro
 		idx++
 	}
 
-	e.assertObjectContiguous(entries)
-
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].name < entries[j].name
 	})
@@ -549,23 +446,7 @@ func (e *encoder) encodeStructObject(rv reflect.Value) (start, end int, err erro
 func (e *encoder) encodeValueObject(obj Object) (start, end int, err error) {
 	n := len(obj.Fields)
 	if n == 0 {
-		isLarge := byte(0)
-		numElemSize := 1
-		fieldIDSizeCode := offsetSizeCode(0)
-		fieldIDSize := offsetSize(fieldIDSizeCode)
-		offsetSzCode := offsetSizeCode(0)
-		offsetSz := offsetSize(offsetSzCode)
-		header := byte(BasicObject) | (fieldIDSizeCode << 2) | (offsetSzCode << 4) | (isLarge << 6)
-		bufSize := 1 + numElemSize + n*fieldIDSize + (n+1)*offsetSz
-		buf := make([]byte, bufSize)
-		buf[0] = header
-		buf[1] = 0
-		writeUint(buf[2:], 0, offsetSz)
-
-		start = len(e.scratch)
-		e.scratch = append(e.scratch, buf...)
-		end = len(e.scratch)
-		return start, end, nil
+		return e.buildObjectBytes(nil)
 	}
 
 	var entriesBuf [16]encodedField
@@ -589,8 +470,6 @@ func (e *encoder) encodeValueObject(obj Object) (start, end int, err error) {
 			end:   pEnd,
 		}
 	}
-
-	e.assertObjectContiguous(entries)
 
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].name < entries[j].name
@@ -661,10 +540,13 @@ func (e *encoder) buildObjectBytes(entries []encodedField) (start, end int, err 
 		pos += entry.end - entry.start
 	}
 
-	firstStart := entries[0].start
-	for _, entry := range entries {
-		if entry.start < firstStart {
-			firstStart = entry.start
+	firstStart := len(e.scratch)
+	if n > 0 {
+		firstStart = entries[0].start
+		for _, entry := range entries {
+			if entry.start < firstStart {
+				firstStart = entry.start
+			}
 		}
 	}
 	e.scratch = e.scratch[:firstStart]
