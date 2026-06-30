@@ -46,6 +46,41 @@ type encodedField struct {
 	end   int
 }
 
+type elementPos struct {
+	start int
+	end   int
+}
+
+func (e *encoder) assertSliceContiguous(positions []elementPos) {
+	if len(positions) == 0 {
+		return
+	}
+	firstStart := positions[0].start
+	if firstStart > len(e.scratch) {
+		panic(fmt.Sprintf("invariant violation: firstStart %d > len(scratch) %d", firstStart, len(e.scratch)))
+	}
+	for i := 1; i < len(positions); i++ {
+		if positions[i].start != positions[i-1].end {
+			panic(fmt.Sprintf("invariant violation: non-contiguous siblings at index %d: start %d != prior end %d", i, positions[i].start, positions[i-1].end))
+		}
+	}
+}
+
+func (e *encoder) assertObjectContiguous(entries []encodedField) {
+	if len(entries) == 0 {
+		return
+	}
+	firstStart := entries[0].start
+	if firstStart > len(e.scratch) {
+		panic(fmt.Sprintf("invariant violation: firstStart %d > len(scratch) %d", firstStart, len(e.scratch)))
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i].start != entries[i-1].end {
+			panic(fmt.Sprintf("invariant violation: non-contiguous siblings at index %d: start %d != prior end %d", i, entries[i].start, entries[i-1].end))
+		}
+	}
+}
+
 func (e *encoder) encodeValue(v Value) (start, end int, err error) {
 	switch v.basic {
 	case BasicObject:
@@ -225,11 +260,6 @@ func (e *encoder) encodeSliceArray(rv reflect.Value) (start, end int, err error)
 		return e.encodeValueArray(Array{})
 	}
 
-	type elementPos struct {
-		start int
-		end   int
-	}
-
 	var posBuf [32]elementPos
 	var positions []elementPos
 	if n <= len(posBuf) {
@@ -245,6 +275,8 @@ func (e *encoder) encodeSliceArray(rv reflect.Value) (start, end int, err error)
 		}
 		positions[i] = elementPos{start: pStart, end: pEnd}
 	}
+
+	e.assertSliceContiguous(positions)
 
 	totalSize := 0
 	for _, pos := range positions {
@@ -324,11 +356,6 @@ func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
 		return start, end, nil
 	}
 
-	type elementPos struct {
-		start int
-		end   int
-	}
-
 	var posBuf [32]elementPos
 	var positions []elementPos
 	if n <= len(posBuf) {
@@ -344,6 +371,8 @@ func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
 		}
 		positions[i] = elementPos{start: pStart, end: pEnd}
 	}
+
+	e.assertSliceContiguous(positions)
 
 	totalSize := 0
 	for _, pos := range positions {
@@ -445,6 +474,8 @@ func (e *encoder) encodeMapObject(rv reflect.Value) (start, end int, err error) 
 		idx++
 	}
 
+	e.assertObjectContiguous(entries)
+
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].name < entries[j].name
 	})
@@ -506,6 +537,8 @@ func (e *encoder) encodeStructObject(rv reflect.Value) (start, end int, err erro
 		idx++
 	}
 
+	e.assertObjectContiguous(entries)
+
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].name < entries[j].name
 	})
@@ -556,6 +589,8 @@ func (e *encoder) encodeValueObject(obj Object) (start, end int, err error) {
 			end:   pEnd,
 		}
 	}
+
+	e.assertObjectContiguous(entries)
 
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].name < entries[j].name
@@ -627,6 +662,11 @@ func (e *encoder) buildObjectBytes(entries []encodedField) (start, end int, err 
 	}
 
 	firstStart := entries[0].start
+	for _, entry := range entries {
+		if entry.start < firstStart {
+			firstStart = entry.start
+		}
+	}
 	e.scratch = e.scratch[:firstStart]
 
 	start = len(e.scratch)
