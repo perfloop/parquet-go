@@ -14,17 +14,136 @@ import (
 // Field names for objects are registered with the provided MetadataBuilder.
 // Returns the encoded value bytes.
 func Encode(b *MetadataBuilder, v Value) []byte {
-	enc := encoder{
-		b:       b,
-		scratch: make([]byte, 0, 1024),
+	switch v.basic {
+	case BasicObject:
+		enc := encoder{
+			b:       b,
+			scratch: make([]byte, 0, 512),
+		}
+		start, end, err := enc.encodeValueObject(v.object)
+		if err != nil {
+			return nil
+		}
+		res := make([]byte, end-start)
+		copy(res, enc.scratch[start:end])
+		return res
+	case BasicArray:
+		enc := encoder{
+			b:       b,
+			scratch: make([]byte, 0, 512),
+		}
+		start, end, err := enc.encodeValueArray(v.array)
+		if err != nil {
+			return nil
+		}
+		res := make([]byte, end-start)
+		copy(res, enc.scratch[start:end])
+		return res
+	default:
+		return encodePrimitive(v)
 	}
-	start, end, err := enc.encodeReflect(reflect.ValueOf(v))
-	if err != nil {
-		return nil
+}
+
+func encodePrimitive(v Value) []byte {
+	switch v.primitive {
+	case PrimitiveNull:
+		return []byte{makeHeader(BasicPrimitive, byte(PrimitiveNull))}
+	case PrimitiveTrue:
+		return []byte{makeHeader(BasicPrimitive, byte(PrimitiveTrue))}
+	case PrimitiveFalse:
+		return []byte{makeHeader(BasicPrimitive, byte(PrimitiveFalse))}
+	case PrimitiveInt8:
+		return []byte{makeHeader(BasicPrimitive, byte(PrimitiveInt8)), byte(v.i64)}
+	case PrimitiveInt16:
+		buf := make([]byte, 3)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveInt16))
+		binary.LittleEndian.PutUint16(buf[1:], uint16(v.i64))
+		return buf
+	case PrimitiveInt32:
+		buf := make([]byte, 5)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveInt32))
+		binary.LittleEndian.PutUint32(buf[1:], uint32(v.i64))
+		return buf
+	case PrimitiveInt64:
+		buf := make([]byte, 9)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveInt64))
+		binary.LittleEndian.PutUint64(buf[1:], uint64(v.i64))
+		return buf
+	case PrimitiveFloat:
+		buf := make([]byte, 5)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveFloat))
+		binary.LittleEndian.PutUint32(buf[1:], math.Float32bits(float32(v.f64)))
+		return buf
+	case PrimitiveDouble:
+		buf := make([]byte, 9)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveDouble))
+		binary.LittleEndian.PutUint64(buf[1:], math.Float64bits(v.f64))
+		return buf
+	case PrimitiveString:
+		s := v.str
+		if len(s) <= 63 {
+			buf := make([]byte, 1+len(s))
+			buf[0] = makeHeader(BasicShortString, byte(len(s)))
+			copy(buf[1:], s)
+			return buf
+		}
+		buf := make([]byte, 5+len(s))
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveString))
+		binary.LittleEndian.PutUint32(buf[1:], uint32(len(s)))
+		copy(buf[5:], s)
+		return buf
+	case PrimitiveBinary:
+		buf := make([]byte, 5+len(v.bytes))
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveBinary))
+		binary.LittleEndian.PutUint32(buf[1:], uint32(len(v.bytes)))
+		copy(buf[5:], v.bytes)
+		return buf
+	case PrimitiveDate:
+		buf := make([]byte, 5)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveDate))
+		binary.LittleEndian.PutUint32(buf[1:], uint32(v.i64))
+		return buf
+	case PrimitiveTimestamp:
+		buf := make([]byte, 9)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveTimestamp))
+		binary.LittleEndian.PutUint64(buf[1:], uint64(v.i64))
+		return buf
+	case PrimitiveTimestampNTZ:
+		buf := make([]byte, 9)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveTimestampNTZ))
+		binary.LittleEndian.PutUint64(buf[1:], uint64(v.i64))
+		return buf
+	case PrimitiveTime:
+		buf := make([]byte, 9)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveTime))
+		binary.LittleEndian.PutUint64(buf[1:], uint64(v.i64))
+		return buf
+	case PrimitiveUUID:
+		buf := make([]byte, 17)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveUUID))
+		copy(buf[1:], v.uuid[:])
+		return buf
+	case PrimitiveDecimal4:
+		buf := make([]byte, 6)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveDecimal4))
+		buf[1] = v.scale
+		binary.LittleEndian.PutUint32(buf[2:], uint32(v.i64))
+		return buf
+	case PrimitiveDecimal8:
+		buf := make([]byte, 10)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveDecimal8))
+		buf[1] = v.scale
+		binary.LittleEndian.PutUint64(buf[2:], uint64(v.i64))
+		return buf
+	case PrimitiveDecimal16:
+		buf := make([]byte, 18)
+		buf[0] = makeHeader(BasicPrimitive, byte(PrimitiveDecimal16))
+		buf[1] = v.scale
+		copy(buf[2:], v.decimal16[:])
+		return buf
+	default:
+		return []byte{makeHeader(BasicPrimitive, byte(PrimitiveNull))}
 	}
-	res := make([]byte, end-start)
-	copy(res, enc.scratch[start:end])
-	return res
 }
 
 // makeHeader constructs a value_metadata byte.
@@ -48,6 +167,9 @@ type elementPos struct {
 	start int
 	end   int
 }
+
+var testHookVerifyArrayLayout func(e *encoder, positions []elementPos)
+var testHookVerifyObjectLayout func(e *encoder, entries []encodedField)
 
 func (e *encoder) encodeValuePrimitive(v Value) (start, end int) {
 	start = len(e.scratch)
@@ -120,6 +242,78 @@ func (e *encoder) encodeValuePrimitive(v Value) (start, end int) {
 	return start, end
 }
 
+func (e *encoder) encodeValue(v Value) (start, end int, err error) {
+	switch v.basic {
+	case BasicObject:
+		return e.encodeValueObject(v.object)
+	case BasicArray:
+		return e.encodeValueArray(v.array)
+	default:
+		start, end = e.encodeValuePrimitive(v)
+		return start, end, nil
+	}
+}
+
+func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
+	n := len(arr.Elements)
+	if n == 0 {
+		return e.buildArrayBytes(nil)
+	}
+
+	var posBuf [32]elementPos
+	var positions []elementPos
+	if n <= len(posBuf) {
+		positions = posBuf[:n]
+	} else {
+		positions = make([]elementPos, n)
+	}
+
+	for i := 0; i < n; i++ {
+		pStart, pEnd, err := e.encodeValue(arr.Elements[i])
+		if err != nil {
+			return 0, 0, err
+		}
+		positions[i] = elementPos{start: pStart, end: pEnd}
+	}
+
+	return e.buildArrayBytes(positions)
+}
+
+func (e *encoder) encodeValueObject(obj Object) (start, end int, err error) {
+	n := len(obj.Fields)
+	if n == 0 {
+		return e.buildObjectBytes(nil)
+	}
+
+	var entriesBuf [16]encodedField
+	var entries []encodedField
+	if n <= len(entriesBuf) {
+		entries = entriesBuf[:n]
+	} else {
+		entries = make([]encodedField, n)
+	}
+
+	for i, f := range obj.Fields {
+		id := e.b.Add(f.Name)
+		pStart, pEnd, err := e.encodeValue(f.Value)
+		if err != nil {
+			return 0, 0, err
+		}
+		entries[i] = encodedField{
+			id:    id,
+			name:  f.Name,
+			start: pStart,
+			end:   pEnd,
+		}
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].name < entries[j].name
+	})
+
+	return e.buildObjectBytes(entries)
+}
+
 func (e *encoder) encodeReflect(rv reflect.Value) (start, end int, err error) {
 	if !rv.IsValid() {
 		start, end = e.encodeValuePrimitive(Null())
@@ -133,66 +327,6 @@ func (e *encoder) encodeReflect(rv reflect.Value) (start, end int, err error) {
 			return start, end, nil
 		}
 		rv = rv.Elem()
-	}
-
-	// Route variant.Value directly to avoid reflection traversal of its fields
-	if rv.Type() == reflect.TypeFor[Value]() {
-		val := rv.Interface().(Value)
-		switch val.basic {
-		case BasicObject:
-			n := len(val.object.Fields)
-			if n == 0 {
-				return e.buildObjectBytes(nil)
-			}
-			var entriesBuf [16]encodedField
-			var entries []encodedField
-			if n <= len(entriesBuf) {
-				entries = entriesBuf[:n]
-			} else {
-				entries = make([]encodedField, n)
-			}
-			for i, f := range val.object.Fields {
-				pStart, pEnd, err := e.encodeReflect(reflect.ValueOf(f.Value))
-				if err != nil {
-					return 0, 0, err
-				}
-				entries[i] = encodedField{
-					id:    e.b.Add(f.Name),
-					name:  f.Name,
-					start: pStart,
-					end:   pEnd,
-				}
-			}
-			sort.Slice(entries, func(i, j int) bool {
-				return entries[i].name < entries[j].name
-			})
-			return e.buildObjectBytes(entries)
-
-		case BasicArray:
-			n := len(val.array.Elements)
-			if n == 0 {
-				return e.buildArrayBytes(nil)
-			}
-			var posBuf [32]elementPos
-			var positions []elementPos
-			if n <= len(posBuf) {
-				positions = posBuf[:n]
-			} else {
-				positions = make([]elementPos, n)
-			}
-			for i := 0; i < n; i++ {
-				pStart, pEnd, err := e.encodeReflect(reflect.ValueOf(val.array.Elements[i]))
-				if err != nil {
-					return 0, 0, err
-				}
-				positions[i] = elementPos{start: pStart, end: pEnd}
-			}
-			return e.buildArrayBytes(positions)
-
-		default:
-			start, end = e.encodeValuePrimitive(val)
-			return start, end, nil
-		}
 	}
 
 	// Check concrete types first
@@ -292,6 +426,10 @@ func (e *encoder) encodeSliceArray(rv reflect.Value) (start, end int, err error)
 
 func (e *encoder) buildArrayBytes(positions []elementPos) (start, end int, err error) {
 	n := len(positions)
+
+	if testHookVerifyArrayLayout != nil {
+		testHookVerifyArrayLayout(e, positions)
+	}
 
 	totalSize := 0
 	for _, pos := range positions {
@@ -466,6 +604,10 @@ func (e *encoder) encodeStructObject(rv reflect.Value) (start, end int, err erro
 
 func (e *encoder) buildObjectBytes(entries []encodedField) (start, end int, err error) {
 	n := len(entries)
+
+	if testHookVerifyObjectLayout != nil {
+		testHookVerifyObjectLayout(e, entries)
+	}
 
 	maxID := 0
 	totalValueSize := 0
