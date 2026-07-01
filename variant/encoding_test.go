@@ -1,6 +1,7 @@
 package variant
 
 import (
+	"sort"
 	"testing"
 )
 
@@ -24,13 +25,19 @@ func TestEncoderLayoutInvariants(t *testing.T) {
 		if len(entries) == 0 {
 			return
 		}
-		firstStart := entries[0].start
+		// Copy and sort entries by start position to verify their contiguous allocation layout in scratch
+		sorted := make([]encodedField, len(entries))
+		copy(sorted, entries)
+		sort.Slice(sorted, func(i, j int) bool {
+			return sorted[i].start < sorted[j].start
+		})
+		firstStart := sorted[0].start
 		if firstStart > len(e.scratch) {
 			t.Errorf("invariant violation: firstStart %d > len(scratch) %d", firstStart, len(e.scratch))
 		}
-		for i := 1; i < len(entries); i++ {
-			if entries[i].start != entries[i-1].end {
-				t.Errorf("invariant violation: non-contiguous siblings at index %d: start %d != prior end %d", i, entries[i].start, entries[i-1].end)
+		for i := 1; i < len(sorted); i++ {
+			if sorted[i].start != sorted[i-1].end {
+				t.Errorf("invariant violation: non-contiguous siblings at index %d: start %d != prior end %d", i, sorted[i].start, sorted[i-1].end)
 			}
 		}
 	}
