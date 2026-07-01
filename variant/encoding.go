@@ -18,7 +18,7 @@ func Encode(b *MetadataBuilder, v Value) []byte {
 		b:       b,
 		scratch: make([]byte, 0, 1024),
 	}
-	start, end, err := enc.encodeValue(v)
+	start, end, err := enc.encodeReflect(reflect.ValueOf(v))
 	if err != nil {
 		return nil
 	}
@@ -28,8 +28,6 @@ func Encode(b *MetadataBuilder, v Value) []byte {
 }
 
 // makeHeader constructs a value_metadata byte.
-// For primitives: bits 0-1 = basic_type(0), bits 2-7 = primitive_type
-// For short strings: bits 0-1 = basic_type(1), bits 2-7 = string length
 func makeHeader(basic BasicType, valueHeader byte) byte {
 	return byte(basic) | (valueHeader << 2)
 }
@@ -49,18 +47,6 @@ type encodedField struct {
 type elementPos struct {
 	start int
 	end   int
-}
-
-func (e *encoder) encodeValue(v Value) (start, end int, err error) {
-	switch v.basic {
-	case BasicObject:
-		return e.encodeValueObject(v.object)
-	case BasicArray:
-		return e.encodeValueArray(v.array)
-	default:
-		start, end = e.encodeValuePrimitive(v)
-		return start, end, nil
-	}
 }
 
 func (e *encoder) encodeValuePrimitive(v Value) (start, end int) {
@@ -149,6 +135,66 @@ func (e *encoder) encodeReflect(rv reflect.Value) (start, end int, err error) {
 		rv = rv.Elem()
 	}
 
+	// Route variant.Value directly to avoid reflection traversal of its fields
+	if rv.Type() == reflect.TypeFor[Value]() {
+		val := rv.Interface().(Value)
+		switch val.basic {
+		case BasicObject:
+			n := len(val.object.Fields)
+			if n == 0 {
+				return e.buildObjectBytes(nil)
+			}
+			var entriesBuf [16]encodedField
+			var entries []encodedField
+			if n <= len(entriesBuf) {
+				entries = entriesBuf[:n]
+			} else {
+				entries = make([]encodedField, n)
+			}
+			for i, f := range val.object.Fields {
+				pStart, pEnd, err := e.encodeReflect(reflect.ValueOf(f.Value))
+				if err != nil {
+					return 0, 0, err
+				}
+				entries[i] = encodedField{
+					id:    e.b.Add(f.Name),
+					name:  f.Name,
+					start: pStart,
+					end:   pEnd,
+				}
+			}
+			sort.Slice(entries, func(i, j int) bool {
+				return entries[i].name < entries[j].name
+			})
+			return e.buildObjectBytes(entries)
+
+		case BasicArray:
+			n := len(val.array.Elements)
+			if n == 0 {
+				return e.buildArrayBytes(nil)
+			}
+			var posBuf [32]elementPos
+			var positions []elementPos
+			if n <= len(posBuf) {
+				positions = posBuf[:n]
+			} else {
+				positions = make([]elementPos, n)
+			}
+			for i := 0; i < n; i++ {
+				pStart, pEnd, err := e.encodeReflect(reflect.ValueOf(val.array.Elements[i]))
+				if err != nil {
+					return 0, 0, err
+				}
+				positions[i] = elementPos{start: pStart, end: pEnd}
+			}
+			return e.buildArrayBytes(positions)
+
+		default:
+			start, end = e.encodeValuePrimitive(val)
+			return start, end, nil
+		}
+	}
+
 	// Check concrete types first
 	if rv.Type() == reflect.TypeFor[uuid.UUID]() {
 		start, end = e.encodeValuePrimitive(UUID(rv.Interface().(uuid.UUID)))
@@ -222,31 +268,6 @@ func (e *encoder) encodeReflect(rv reflect.Value) (start, end int, err error) {
 func (e *encoder) encodeSliceArray(rv reflect.Value) (start, end int, err error) {
 	n := rv.Len()
 	if n == 0 {
-		return e.encodeValueArray(Array{})
-	}
-
-	var posBuf [32]elementPos
-	var positions []elementPos
-	if n <= len(posBuf) {
-		positions = posBuf[:n]
-	} else {
-		positions = make([]elementPos, n)
-	}
-
-	for i := 0; i < n; i++ {
-		pStart, pEnd, err := e.encodeReflect(rv.Index(i))
-		if err != nil {
-			return 0, 0, err
-		}
-		positions[i] = elementPos{start: pStart, end: pEnd}
-	}
-
-	return e.buildArrayBytes(positions)
-}
-
-func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
-	n := len(arr.Elements)
-	if n == 0 {
 		return e.buildArrayBytes(nil)
 	}
 
@@ -259,7 +280,7 @@ func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
 	}
 
 	for i := 0; i < n; i++ {
-		pStart, pEnd, err := e.encodeValue(arr.Elements[i])
+		pStart, pEnd, err := e.encodeReflect(rv.Index(i))
 		if err != nil {
 			return 0, 0, err
 		}
@@ -434,41 +455,6 @@ func (e *encoder) encodeStructObject(rv reflect.Value) (start, end int, err erro
 			end:   pEnd,
 		}
 		idx++
-	}
-
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].name < entries[j].name
-	})
-
-	return e.buildObjectBytes(entries)
-}
-
-func (e *encoder) encodeValueObject(obj Object) (start, end int, err error) {
-	n := len(obj.Fields)
-	if n == 0 {
-		return e.buildObjectBytes(nil)
-	}
-
-	var entriesBuf [16]encodedField
-	var entries []encodedField
-	if n <= len(entriesBuf) {
-		entries = entriesBuf[:n]
-	} else {
-		entries = make([]encodedField, n)
-	}
-
-	for i, f := range obj.Fields {
-		id := e.b.Add(f.Name)
-		pStart, pEnd, err := e.encodeValue(f.Value)
-		if err != nil {
-			return 0, 0, err
-		}
-		entries[i] = encodedField{
-			id:    id,
-			name:  f.Name,
-			start: pStart,
-			end:   pEnd,
-		}
 	}
 
 	sort.Slice(entries, func(i, j int) bool {
