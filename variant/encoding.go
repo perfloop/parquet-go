@@ -268,7 +268,7 @@ func (e *encoder) encodeValueArray(arr Array) (start, end int, err error) {
 		positions = make([]elementPos, n)
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		pStart, pEnd, err := e.encodeValue(arr.Elements[i])
 		if err != nil {
 			return 0, 0, err
@@ -413,7 +413,7 @@ func (e *encoder) encodeSliceArray(rv reflect.Value) (start, end int, err error)
 		positions = make([]elementPos, n)
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		pStart, pEnd, err := e.encodeReflect(rv.Index(i))
 		if err != nil {
 			return 0, 0, err
@@ -546,7 +546,7 @@ func (e *encoder) encodeStructObject(rv reflect.Value) (start, end int, err erro
 	numFields := rt.NumField()
 
 	visibleCount := 0
-	for i := 0; i < numFields; i++ {
+	for i := range numFields {
 		sf := rt.Field(i)
 		if !sf.IsExported() {
 			continue
@@ -571,7 +571,7 @@ func (e *encoder) encodeStructObject(rv reflect.Value) (start, end int, err erro
 	}
 
 	idx := 0
-	for i := 0; i < numFields; i++ {
+	for i := range numFields {
 		sf := rt.Field(i)
 		if !sf.IsExported() {
 			continue

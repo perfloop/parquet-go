@@ -9,9 +9,9 @@ func BenchmarkMarshalInt64Slice(b *testing.B) {
 	for i := range slice {
 		slice[i] = int64(i)
 	}
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		meta, val, err := Marshal(slice)
 		if err != nil {
 			b.Fatal(err)
@@ -24,9 +24,9 @@ func BenchmarkMarshalInt64Slice(b *testing.B) {
 func BenchmarkEncodePrimitive(b *testing.B) {
 	v := Int64(42)
 	var builder MetadataBuilder
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = Encode(&builder, v)
 	}
 }
@@ -44,9 +44,9 @@ func BenchmarkEncodeNested(b *testing.B) {
 	arr := MakeArray(elements)
 
 	var builder MetadataBuilder
-	b.ResetTimer()
+
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = Encode(&builder, arr)
 	}
 }
