@@ -153,24 +153,35 @@ TEXT ·combinedBoundsInt64(SB), NOSPLIT, $-40
     CMPB ·hasAVX512VL(SB), $0
     JE loop
 
-    CMPQ CX, $16
+    CMPQ CX, $32
     JB loop
 
     MOVQ CX, DI
-    SHRQ $4, DI
-    SHLQ $4, DI
+    SHRQ $5, DI
+    SHLQ $5, DI
     VPBROADCASTQ (AX), Z0
+    VPBROADCASTQ (AX), Z1
+    VPBROADCASTQ (AX), Z2
     VPBROADCASTQ (AX), Z3
-loop16:
-    VMOVDQU64 (AX)(SI*8), Z1
-    VMOVDQU64 64(AX)(SI*8), Z2
-    VPMINSQ Z1, Z0, Z0
-    VPMINSQ Z2, Z0, Z0
-    VPMAXSQ Z1, Z3, Z3
-    VPMAXSQ Z2, Z3, Z3
-    ADDQ $16, SI
+loop32:
+    VMOVDQU64 (AX)(SI*8), Z4
+    VMOVDQU64 64(AX)(SI*8), Z5
+    VMOVDQU64 128(AX)(SI*8), Z6
+    VMOVDQU64 192(AX)(SI*8), Z7
+    VPMINSQ Z4, Z0, Z0
+    VPMINSQ Z5, Z1, Z1
+    VPMAXSQ Z4, Z2, Z2
+    VPMAXSQ Z5, Z3, Z3
+    VPMINSQ Z6, Z0, Z0
+    VPMINSQ Z7, Z1, Z1
+    VPMAXSQ Z6, Z2, Z2
+    VPMAXSQ Z7, Z3, Z3
+    ADDQ $32, SI
     CMPQ SI, DI
-    JNE loop16
+    JNE loop32
+
+    VPMINSQ Z1, Z0, Z0
+    VPMAXSQ Z2, Z3, Z3
 
     VMOVDQU32 swap32+0(SB), Z1
     VMOVDQU32 swap32+0(SB), Z2
