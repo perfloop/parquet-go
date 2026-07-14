@@ -36,11 +36,11 @@ package parquet
 // memory-bound anymore, but limited by contention on CPU ports, and the
 // individual min/max functions are able to better parallelize the work due
 // to running less instructions per loop. The shared threshold applies to all
-// types and to the scalar fallback. The int64-specific threshold is only used
-// when the AVX-512VL implementation is available.
+// types and to the scalar fallback. The int64-specific threshold matches the
+// default writer page flush size and is only used when AVX-512VL is available.
 const (
 	combinedBoundsThreshold      = 1 * 1024 * 1024
-	combinedBoundsInt64Threshold = DefaultPageBufferSize
+	combinedBoundsInt64Threshold = DefaultPageBufferSize * 98 / 100
 )
 
 //go:noescape

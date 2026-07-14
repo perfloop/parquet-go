@@ -14,6 +14,8 @@ func TestBoundsInt64DefaultPageSizeBoundary(t *testing.T) {
 	for _, size := range []int{
 		0,
 		1,
+		combinedBoundsInt64Threshold / 8,
+		combinedBoundsInt64Threshold/8 + 1,
 		DefaultPageBufferSize/8 - 1,
 		DefaultPageBufferSize / 8,
 	} {

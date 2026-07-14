@@ -3,6 +3,7 @@ package parquet
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"math/rand"
 	"reflect"
 	"testing"
@@ -70,6 +71,14 @@ func TestBoundsInt64(t *testing.T) {
 	})
 	if err != nil {
 		t.Error(err)
+	}
+
+	values := make([]int64, DefaultPageBufferSize/8)
+	values[len(values)/3] = math.MinInt64
+	values[2*len(values)/3] = math.MaxInt64
+	minValue, maxValue := boundsInt64(values)
+	if minValue != math.MinInt64 || maxValue != math.MaxInt64 {
+		t.Fatalf("boundsInt64(default-page values) = (%d, %d), want (%d, %d)", minValue, maxValue, math.MinInt64, math.MaxInt64)
 	}
 }
 
