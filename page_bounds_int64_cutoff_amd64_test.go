@@ -4,6 +4,7 @@ package parquet
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/parquet-go/parquet-go/encoding"
@@ -25,13 +26,49 @@ func TestBoundsInt64DefaultPageSizeBoundary(t *testing.T) {
 				return
 			}
 
-			values := makeBenchmarkBoundsInt64Values(size)
-			wantMin, wantMax := scalarBoundsInt64(values)
-			gotMin, gotMax := boundsInt64(values)
-			if gotMin != wantMin || gotMax != wantMax {
-				t.Fatalf("boundsInt64() = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
-			}
+			assertBoundsInt64(t, makeBenchmarkBoundsInt64Values(size))
 		})
+	}
+
+	if !hasAVX512VL {
+		return
+	}
+
+	const vectorLoopValues = DefaultPageBufferSize / 8
+	for offset := range 32 {
+		t.Run(fmt.Sprintf("vector-lane-%d", offset), func(t *testing.T) {
+			values := make([]int64, vectorLoopValues)
+			values[offset] = math.MinInt64
+			values[(offset+1)%32] = math.MaxInt64
+			assertBoundsInt64(t, values)
+		})
+	}
+
+	for tail := range 32 {
+		t.Run(fmt.Sprintf("tail-%d", tail), func(t *testing.T) {
+			values := make([]int64, vectorLoopValues+tail)
+			if tail == 0 {
+				values[0] = math.MinInt64
+				values[1] = math.MaxInt64
+			} else {
+				values[len(values)-1] = math.MinInt64
+				if tail == 1 {
+					values[0] = math.MaxInt64
+				} else {
+					values[len(values)-2] = math.MaxInt64
+				}
+			}
+			assertBoundsInt64(t, values)
+		})
+	}
+}
+
+func assertBoundsInt64(t *testing.T, values []int64) {
+	t.Helper()
+	wantMin, wantMax := scalarBoundsInt64(values)
+	gotMin, gotMax := boundsInt64(values)
+	if gotMin != wantMin || gotMax != wantMax {
+		t.Fatalf("boundsInt64() = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
 	}
 }
 

@@ -35,9 +35,9 @@ package parquet
 // The probable explanation is that in those cases the algorithms are not
 // memory-bound anymore, but limited by contention on CPU ports, and the
 // individual min/max functions are able to better parallelize the work due
-// to running less instructions per loop. The performance starts to equalize
-// around 256KiB, and degrade beyond 1MiB, so we use this threshold to determine
-// which approach to prefer.
+// to running less instructions per loop. The shared threshold applies to all
+// types and to the scalar fallback. The int64-specific threshold is only used
+// when the AVX-512VL implementation is available.
 const (
 	combinedBoundsThreshold      = 1 * 1024 * 1024
 	combinedBoundsInt64Threshold = DefaultPageBufferSize
@@ -77,7 +77,9 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	if 8*len(data) >= combinedBoundsInt64Threshold {
+	byteLen := 8 * len(data)
+	if byteLen >= combinedBoundsThreshold ||
+		(hasAVX512VL && byteLen >= combinedBoundsInt64Threshold) {
 		return combinedBoundsInt64(data)
 	}
 	min = minInt64(data)

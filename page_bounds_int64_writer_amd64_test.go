@@ -4,7 +4,6 @@ package parquet
 
 import (
 	"bytes"
-	"fmt"
 	"math"
 	"testing"
 
@@ -14,27 +13,6 @@ import (
 
 type benchmarkWriterInt64Row struct {
 	Value int64
-}
-
-func TestCombinedBoundsInt64Tails(t *testing.T) {
-	base := DefaultPageBufferSize / 8
-	for tail := range 32 {
-		t.Run(fmt.Sprintf("%d", tail), func(t *testing.T) {
-			values := makeBenchmarkBoundsInt64Values(base + tail)
-			if tail > 0 {
-				values[len(values)-1] = math.MinInt64
-			}
-			if tail > 1 {
-				values[len(values)-2] = math.MaxInt64
-			}
-
-			wantMin, wantMax := scalarBoundsInt64(values)
-			gotMin, gotMax := boundsInt64(values)
-			if gotMin != wantMin || gotMax != wantMax {
-				t.Fatalf("boundsInt64() = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
-			}
-		})
-	}
 }
 
 func TestBoundsInt64WithoutAVX512(t *testing.T) {
