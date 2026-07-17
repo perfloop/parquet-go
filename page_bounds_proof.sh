@@ -44,7 +44,7 @@ fi
 
 benchmark_regexp=$1
 selector=$2
-binary=${PERFLOOP_BENCH_BIN:-${PERFLOOP_BOUNDS_INT64_TEST_BINARY:-./.perfloop-bounds-int64.test}}
+binary=${PERFLOOP_BENCH_BIN:?PERFLOOP_BENCH_BIN is required for benchmark samples}
 
 case "$selector" in
 	BenchmarkBoundsInt32/*) primitive_type=Int32 ;;

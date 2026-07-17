@@ -41,8 +41,8 @@ const combinedBoundsThreshold = 1 * 1024 * 1024
 
 // combinedBoundsInt64Threshold is the first complete INT64 page past the
 // writer's 98%-sized default page buffer: 32113 values occupy 256904 bytes,
-// just above its 256901-byte target. The INT64 combined kernel uses four
-// independent accumulators to avoid a single min/max dependency chain.
+// just above its 256901-byte target. The INT64 combined kernel reads page
+// values once while finding both bounds.
 const combinedBoundsInt64Threshold = 32113
 
 //go:noescape

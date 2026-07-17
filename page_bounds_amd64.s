@@ -153,70 +153,49 @@ TEXT ·combinedBoundsInt64(SB), NOSPLIT, $-40
     CMPB ·hasAVX512VL(SB), $0
     JE loop
 
-    CMPQ CX, $32
+    CMPQ CX, $16
     JB loop
 
     MOVQ CX, DI
-    SHRQ $5, DI
-    SHLQ $5, DI
-    // Keep four min/max dependency chains independent while processing the
-    // four 512-bit blocks in each iteration.
+    SHRQ $4, DI
+    SHLQ $4, DI
     VPBROADCASTQ (AX), Z0
-    VPBROADCASTQ (AX), Z1
-    VPBROADCASTQ (AX), Z2
     VPBROADCASTQ (AX), Z3
-    VPBROADCASTQ (AX), Z4
-    VPBROADCASTQ (AX), Z5
-    VPBROADCASTQ (AX), Z6
-    VPBROADCASTQ (AX), Z7
-loop32:
-    VMOVDQU64 (AX)(SI*8), Z8
-    VMOVDQU64 64(AX)(SI*8), Z9
-    VMOVDQU64 128(AX)(SI*8), Z10
-    VMOVDQU64 192(AX)(SI*8), Z11
-    VPMINSQ Z8, Z0, Z0
-    VPMINSQ Z9, Z1, Z1
-    VPMINSQ Z10, Z2, Z2
-    VPMINSQ Z11, Z3, Z3
-    VPMAXSQ Z8, Z4, Z4
-    VPMAXSQ Z9, Z5, Z5
-    VPMAXSQ Z10, Z6, Z6
-    VPMAXSQ Z11, Z7, Z7
-    ADDQ $32, SI
-    CMPQ SI, DI
-    JNE loop32
-
+loop16:
+    VMOVDQU64 (AX)(SI*8), Z1
+    VMOVDQU64 64(AX)(SI*8), Z2
     VPMINSQ Z1, Z0, Z0
-    VPMINSQ Z3, Z2, Z2
     VPMINSQ Z2, Z0, Z0
-    VPMAXSQ Z5, Z4, Z4
-    VPMAXSQ Z7, Z6, Z6
-    VPMAXSQ Z6, Z4, Z4
+    VPMAXSQ Z1, Z3, Z3
+    VPMAXSQ Z2, Z3, Z3
+    ADDQ $16, SI
+    CMPQ SI, DI
+    JNE loop16
 
-    VMOVDQU32 swap32+0(SB), Z8
-    VMOVDQU32 swap32+0(SB), Z9
-    VPERMI2D Z0, Z0, Z8
-    VPERMI2D Z4, Z4, Z9
-    VPMINSQ Y8, Y0, Y0
-    VPMAXSQ Y9, Y4, Y4
+    VMOVDQU32 swap32+0(SB), Z1
+    VMOVDQU32 swap32+0(SB), Z2
+    VPERMI2D Z0, Z0, Z1
+    VPERMI2D Z3, Z3, Z2
+    VPMINSQ Y1, Y0, Y0
+    VPMAXSQ Y2, Y3, Y3
 
-    VMOVDQU32 swap32+32(SB), Y8
-    VMOVDQU32 swap32+32(SB), Y9
-    VPERMI2D Y0, Y0, Y8
-    VPERMI2D Y4, Y4, Y9
-    VPMINSQ X8, X0, X0
-    VPMAXSQ X9, X4, X4
+    VMOVDQU32 swap32+32(SB), Y1
+    VMOVDQU32 swap32+32(SB), Y2
+    VPERMI2D Y0, Y0, Y1
+    VPERMI2D Y3, Y3, Y2
+    VPMINSQ X1, X0, X0
+    VPMAXSQ X2, X3, X3
 
-    VMOVDQU32 swap32+48(SB), X8
-    VMOVDQU32 swap32+48(SB), X9
-    VPERMI2D X0, X0, X8
-    VPERMI2D X4, X4, X9
-    VPMINSQ X8, X0, X0
-    VPMAXSQ X9, X4, X4
+    VMOVDQU32 swap32+48(SB), X1
+    VMOVDQU32 swap32+48(SB), X2
+    VPERMI2D X0, X0, X1
+    VPERMI2D X3, X3, X2
+    VPMINSQ X1, X0, X0
+    VPMAXSQ X2, X3, X3
     VZEROUPPER
 
     MOVQ X0, R8
-    MOVQ X4, R9
+    MOVQ X3, R9
     CMPQ SI, CX
     JE done
 loop:
