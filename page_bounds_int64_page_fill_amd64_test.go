@@ -9,21 +9,14 @@ import (
 	"github.com/parquet-go/parquet-go/encoding"
 )
 
-const (
-	boundsInt64DispatchUpperCutoff = 131072
-	boundsInt64PageFillBefore      = 32112
-	boundsInt64PageFillAt          = 32113
-	boundsInt64PageFillTwoPages    = 64225
-)
-
 func TestBoundsInt64WriterPageFill(t *testing.T) {
 	for _, test := range [...]struct {
 		numValues int
 		numPages  int
 	}{
-		{numValues: boundsInt64PageFillBefore, numPages: 1},
-		{numValues: boundsInt64PageFillAt, numPages: 1},
-		{numValues: boundsInt64PageFillTwoPages, numPages: 2},
+		{numValues: combinedBoundsInt64Threshold - 1, numPages: 1},
+		{numValues: combinedBoundsInt64Threshold, numPages: 1},
+		{numValues: 2*combinedBoundsInt64Threshold - 1, numPages: 2},
 	} {
 		t.Run(strconv.Itoa(test.numValues)+"-values", func(t *testing.T) {
 			values := boundsInt64CutoffValues(test.numValues)
@@ -64,7 +57,7 @@ func TestBoundsInt64WriterPageFill(t *testing.T) {
 }
 
 func BenchmarkBoundsInt64PageStatistics(b *testing.B) {
-	const numValues = boundsInt64PageFillAt
+	const numValues = combinedBoundsInt64Threshold
 
 	values := boundsInt64CutoffValues(numValues)
 	wantMin, wantMax := boundsInt64CutoffOracle(values)
@@ -81,27 +74,11 @@ func BenchmarkBoundsInt64PageStatistics(b *testing.B) {
 	}
 }
 
-func BenchmarkBoundsInt64DispatchUpperCutoff(b *testing.B) {
-	const numValues = boundsInt64DispatchUpperCutoff
-
-	values := boundsInt64CutoffValues(numValues)
-	wantMin, wantMax := boundsInt64CutoffOracle(values)
-	b.SetBytes(int64(len(values) * 8))
-
-	var gotMin, gotMax int64
-	for b.Loop() {
-		gotMin, gotMax = boundsInt64(values)
-	}
-	if gotMin != wantMin || gotMax != wantMax {
-		b.Fatalf("boundsInt64 = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
-	}
-}
-
 func BenchmarkBoundsInt64WriterPageFill(b *testing.B) {
 	for _, numValues := range [...]int{
-		boundsInt64PageFillBefore,
-		boundsInt64PageFillAt,
-		boundsInt64PageFillTwoPages,
+		combinedBoundsInt64Threshold - 1,
+		combinedBoundsInt64Threshold,
+		2*combinedBoundsInt64Threshold - 1,
 	} {
 		b.Run(strconv.Itoa(numValues)+"-values", func(b *testing.B) {
 			values := boundsInt64CutoffValues(numValues)

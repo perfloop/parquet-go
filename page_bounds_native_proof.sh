@@ -16,9 +16,8 @@ benchmark_regexp=$1
 benchmark_name=$2
 
 if [[ ${PERFLOOP_DISABLE_AVX512:-} == 1 ]]; then
-	GODEBUG=cpu.avx512vl=off go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
-		perfloop-go-bench-json "$benchmark_name" 'ns/op'
-else
-	go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
-		perfloop-go-bench-json "$benchmark_name" 'ns/op'
+	export GODEBUG=cpu.avx512vl=off
 fi
+
+go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
+	perfloop-go-bench-json "$benchmark_name" 'ns/op'

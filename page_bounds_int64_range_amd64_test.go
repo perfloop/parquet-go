@@ -1,3 +1,5 @@
+//go:build !purego
+
 package parquet
 
 import (
@@ -24,12 +26,25 @@ func BenchmarkBoundsInt64DispatchRange(b *testing.B) {
 	}
 }
 
+func BenchmarkBoundsInt64DispatchUpperCutoff(b *testing.B) {
+	const numValues = combinedBoundsThreshold / 8
+
+	values := boundsInt64CutoffValues(numValues)
+	wantMin, wantMax := boundsInt64CutoffOracle(values)
+	b.SetBytes(int64(len(values) * 8))
+
+	var gotMin, gotMax int64
+	for b.Loop() {
+		gotMin, gotMax = boundsInt64(values)
+	}
+	if gotMin != wantMin || gotMax != wantMax {
+		b.Fatalf("boundsInt64 = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
+	}
+}
+
 func BenchmarkBoundsInt64WriterDefaultPages(b *testing.B) {
 	values := boundsInt64CutoffValues(8 * combinedBoundsInt64Threshold)
-	rows := make([]boundsInt64WriterRow, len(values))
-	for i, value := range values {
-		rows[i].Value = value
-	}
+	rows := boundsInt64PageFillRows(values)
 
 	for _, statistics := range [...]bool{true, false} {
 		name := "WithoutStatistics"
