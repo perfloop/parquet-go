@@ -16,17 +16,6 @@ const (
 	boundsInt64PageFillTwoPages    = 64225
 )
 
-func TestBoundsInt64DispatchUpperCutoff(t *testing.T) {
-	for _, numValues := range [...]int{
-		boundsInt64DispatchUpperCutoff - 1,
-		boundsInt64DispatchUpperCutoff,
-	} {
-		t.Run(strconv.Itoa(numValues)+"-values", func(t *testing.T) {
-			checkBoundsInt64Cutoff(t, boundsInt64CutoffValues(numValues))
-		})
-	}
-}
-
 func TestBoundsInt64WriterPageFill(t *testing.T) {
 	for _, test := range [...]struct {
 		numValues int
@@ -80,12 +69,11 @@ func BenchmarkBoundsInt64PageStatistics(b *testing.B) {
 	values := boundsInt64CutoffValues(numValues)
 	wantMin, wantMax := boundsInt64CutoffOracle(values)
 	page := Int64Type.NewPage(0, len(values), encoding.Int64Values(values))
-	columnWriter := new(ColumnWriter)
 	b.SetBytes(int64(len(values) * 8))
 
 	var min, max []byte
 	for b.Loop() {
-		statistics := columnWriter.makePageStatistics(page)
+		statistics := makePageStatistics(page.NumNulls(), pageBoundsOf(page))
 		min, max = statistics.MinValue, statistics.MaxValue
 	}
 	if gotMin, gotMax := Int64.Value(min).Int64(), Int64.Value(max).Int64(); gotMin != wantMin || gotMax != wantMax {

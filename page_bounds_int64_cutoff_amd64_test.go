@@ -81,26 +81,16 @@ type boundsInt64WriterRow struct {
 
 func BenchmarkBoundsInt64WriterDefaultPage(b *testing.B) {
 	values := boundsInt64CutoffValues(combinedBoundsInt64Threshold)
-	rows := make([]boundsInt64WriterRow, len(values))
-	for i, value := range values {
-		rows[i].Value = value
-	}
+	rows := boundsInt64PageFillRows(values)
 	b.SetBytes(int64(len(values) * 8))
 
 	for b.Loop() {
-		writer := NewGenericWriter[boundsInt64WriterRow](io.Discard,
-			PageBufferSize(DefaultPageBufferSize),
-			DataPageStatistics(true),
-		)
-		n, err := writer.Write(rows)
+		written, err := writeBoundsInt64PageFill(io.Discard, rows)
 		if err != nil {
 			b.Fatal(err)
 		}
-		if n != len(rows) {
-			b.Fatalf("writer.Write wrote %d rows, want %d", n, len(rows))
-		}
-		if err := writer.Close(); err != nil {
-			b.Fatal(err)
+		if written != len(rows) {
+			b.Fatalf("writer.Write wrote %d rows, want %d", written, len(rows))
 		}
 	}
 }

@@ -2536,20 +2536,14 @@ func (c *ColumnWriter) fallbackDictionaryToPlain() error {
 }
 
 type pageBounds struct {
-	min        Value
-	max        Value
-	ok         bool
-	calculated bool
+	min Value
+	max Value
+	ok  bool
 }
 
 func pageBoundsOf(page Page) (bounds pageBounds) {
 	bounds.min, bounds.max, bounds.ok = page.Bounds()
-	bounds.calculated = true
 	return bounds
-}
-
-func (c *ColumnWriter) makePageStatistics(page Page) format.Statistics {
-	return makePageStatistics(page.NumNulls(), pageBoundsOf(page))
 }
 
 func makePageStatistics(numNulls int64, bounds pageBounds) format.Statistics {
@@ -2571,10 +2565,6 @@ func (c *ColumnWriter) recordPageStats(headerSize int32, header *format.PageHead
 	if page != nil {
 		numNulls := page.NumNulls()
 		numValues := page.NumValues()
-
-		if c.writePageBounds && !bounds.calculated {
-			bounds = pageBoundsOf(page)
-		}
 
 		minValue, maxValue, pageHasBounds := bounds.min, bounds.max, c.writePageBounds && bounds.ok
 
