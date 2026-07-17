@@ -35,10 +35,15 @@ package parquet
 // The probable explanation is that in those cases the algorithms are not
 // memory-bound anymore, but limited by contention on CPU ports, and the
 // individual min/max functions are able to better parallelize the work due
-// to running less instructions per loop. The performance starts to equalize
-// around 256KiB, and degrade beyond 1MiB, so we use this threshold to determine
-// which approach to prefer.
+// to running less instructions per loop. The generic kernels start to equalize
+// around 256KiB and degrade beyond 1MiB, so this is their threshold.
 const combinedBoundsThreshold = 1 * 1024 * 1024
+
+// combinedBoundsInt64Threshold is the first complete INT64 page past the
+// writer's 98%-sized default page buffer: 32113 values occupy 256904 bytes,
+// just above its 256901-byte target. The INT64 combined kernel uses four
+// independent accumulators to avoid a single min/max dependency chain.
+const combinedBoundsInt64Threshold = 32113
 
 //go:noescape
 func combinedBoundsBool(data []bool) (min, max bool)
@@ -74,7 +79,7 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	if 8*len(data) >= combinedBoundsThreshold {
+	if len(data) >= combinedBoundsInt64Threshold {
 		return combinedBoundsInt64(data)
 	}
 	min = minInt64(data)
