@@ -14,13 +14,11 @@ fi
 
 benchmark_regexp=$1
 benchmark_name=$2
-go_cache=${PERFLOOP_GO_CACHE:-"$PWD/.perfloop-go-cache"}
 
 if [[ ${PERFLOOP_DISABLE_AVX512:-} == 1 ]]; then
-	GODEBUG=cpu.avx512vl=off GOCACHE="$go_cache" \
-		go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
+	GODEBUG=cpu.avx512vl=off go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
 		perfloop-go-bench-json "$benchmark_name" 'ns/op'
 else
-	GOCACHE="$go_cache" go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
+	go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
 		perfloop-go-bench-json "$benchmark_name" 'ns/op'
 fi

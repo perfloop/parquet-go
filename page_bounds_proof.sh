@@ -7,7 +7,6 @@ set -euo pipefail
 
 valgrind_root=${PERFLOOP_CALLGRIND_ROOT:-/workspace/deps/tools/valgrind}
 valgrind=$valgrind_root/usr/bin/valgrind
-go_cache=${PERFLOOP_GO_CACHE:-"$PWD/.perfloop-go-cache"}
 
 ensure_callgrind() {
 	if [[ -x $valgrind ]]; then
@@ -33,7 +32,7 @@ ensure_callgrind() {
 if [[ $# -eq 1 && $1 == --build ]]; then
 	: "${PERFLOOP_BENCH_BIN:?PERFLOOP_BENCH_BIN is required in --build mode}"
 	ensure_callgrind
-	GOCACHE="$go_cache" go test -c -o "$PERFLOOP_BENCH_BIN" .
+	go test -c -o "$PERFLOOP_BENCH_BIN" .
 	exit
 fi
 
@@ -64,7 +63,7 @@ if [[ ! -x $valgrind || ! -x $binary ]]; then
 	exit 1
 fi
 
-GOCACHE="$go_cache" go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
+go test -run '^$' -bench="$benchmark_regexp" -benchmem -count=1 . |
 	perfloop-go-bench-json "$selector" 'ns/op'
 
 temporary_directory=$(mktemp -d)
