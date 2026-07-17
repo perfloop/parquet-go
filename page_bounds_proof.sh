@@ -76,9 +76,8 @@ GOMAXPROCS=1 GODEBUG=asyncpreemptoff=1,cpu.avx512vl=off \
 	"$valgrind" --tool=callgrind --callgrind-out-file="$trace" \
 	"$binary" -test.run '^$' -test.bench="$benchmark_regexp" \
 	-test.benchtime=1x -test.count=1 \
-	>"$temporary_directory/benchmark.out" 2>"$temporary_directory/callgrind.log"
+	>/dev/null 2>&1
 
-cp "$trace" "$temporary_directory/callgrind-copy.out"
 instructions=$(awk -v primitive="$primitive_type" '
 function isKernel(symbol) {
 	return symbol == "github.com/parquet-go/parquet-go.min" primitive ".abi0" ||
@@ -120,5 +119,5 @@ END {
 	if (!found || total == 0) exit 1
 	print total
 }
-' "$trace" "$temporary_directory/callgrind-copy.out")
+' "$trace" "$trace")
 printf '{"metric":"CPU instructions (Callgrind scalar fallback)","value":%s}\n' "$instructions"
