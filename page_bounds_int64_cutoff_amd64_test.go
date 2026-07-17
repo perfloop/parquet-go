@@ -7,8 +7,6 @@ import (
 	"testing"
 )
 
-const boundsInt64CombinedCutoff = 32113
-
 func boundsInt64CutoffValues(n int) []int64 {
 	values := make([]int64, n)
 	prng := rand.New(rand.NewSource(int64(n)))
@@ -42,17 +40,17 @@ func checkBoundsInt64Cutoff(t *testing.T, values []int64) {
 }
 
 func TestBoundsInt64CombinedCutoff(t *testing.T) {
-	checkBoundsInt64Cutoff(t, boundsInt64CutoffValues(boundsInt64CombinedCutoff-1))
+	checkBoundsInt64Cutoff(t, boundsInt64CutoffValues(combinedBoundsInt64Threshold-1))
 
 	for lane := range 32 {
-		values := make([]int64, boundsInt64CombinedCutoff)
+		values := make([]int64, combinedBoundsInt64Threshold)
 		values[lane] = -1
 		values[(lane+1)%32] = 1
 		checkBoundsInt64Cutoff(t, values)
 	}
 
 	for tail := range 32 {
-		values := boundsInt64CutoffValues(boundsInt64CombinedCutoff + tail)
+		values := boundsInt64CutoffValues(combinedBoundsInt64Threshold + tail)
 		values[len(values)-2] = -1 << 63
 		values[len(values)-1] = 1<<63 - 1
 		checkBoundsInt64Cutoff(t, values)
@@ -60,7 +58,7 @@ func TestBoundsInt64CombinedCutoff(t *testing.T) {
 }
 
 func BenchmarkBoundsInt64CombinedCutoff(b *testing.B) {
-	for _, numValues := range [...]int{boundsInt64CombinedCutoff - 1, boundsInt64CombinedCutoff} {
+	for _, numValues := range [...]int{combinedBoundsInt64Threshold - 1, combinedBoundsInt64Threshold} {
 		b.Run(strconv.Itoa(numValues)+"-values", func(b *testing.B) {
 			values := boundsInt64CutoffValues(numValues)
 			wantMin, wantMax := boundsInt64CutoffOracle(values)
@@ -82,7 +80,7 @@ type boundsInt64WriterRow struct {
 }
 
 func BenchmarkBoundsInt64WriterDefaultPage(b *testing.B) {
-	values := boundsInt64CutoffValues(boundsInt64CombinedCutoff)
+	values := boundsInt64CutoffValues(combinedBoundsInt64Threshold)
 	rows := make([]boundsInt64WriterRow, len(values))
 	for i, value := range values {
 		rows[i].Value = value

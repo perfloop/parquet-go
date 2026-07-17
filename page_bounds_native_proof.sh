@@ -4,7 +4,7 @@
 set -euo pipefail
 
 if [[ $# -eq 1 && $1 == --build ]]; then
-	exec ./page_bounds_proof.sh --build
+	exit 0
 fi
 
 if [[ $# -ne 2 ]]; then

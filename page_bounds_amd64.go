@@ -40,13 +40,6 @@ package parquet
 // which approach to prefer.
 const combinedBoundsThreshold = 1 * 1024 * 1024
 
-// combinedBoundsInt64Threshold is the first complete INT64 page past the
-// writer's 98%-sized default page buffer: 32113 values occupy 256904 bytes,
-// just above its 256901-byte target. On AVX-512VL systems, the specialized
-// kernel reads page values once while finding both bounds. Larger inputs keep
-// using the existing combined kernel.
-const combinedBoundsInt64Threshold = 32113
-
 //go:noescape
 func combinedBoundsInt64AVX512(data []int64) (min, max int64)
 

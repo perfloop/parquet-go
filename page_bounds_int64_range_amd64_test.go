@@ -25,7 +25,7 @@ func BenchmarkBoundsInt64DispatchRange(b *testing.B) {
 }
 
 func BenchmarkBoundsInt64WriterDefaultPages(b *testing.B) {
-	values := boundsInt64CutoffValues(8 * boundsInt64CombinedCutoff)
+	values := boundsInt64CutoffValues(8 * combinedBoundsInt64Threshold)
 	rows := make([]boundsInt64WriterRow, len(values))
 	for i, value := range values {
 		rows[i].Value = value
