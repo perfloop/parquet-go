@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/parquet-go/parquet-go/encoding"
 	"github.com/parquet-go/parquet-go/encoding/thrift"
 	"github.com/parquet-go/parquet-go/format"
 )
@@ -439,6 +440,44 @@ func BenchmarkLevelHistogram(b *testing.B) {
 			)
 		}
 	})
+}
+
+type boundsCountingPage struct {
+	Page
+	calls int
+}
+
+func (page *boundsCountingPage) Bounds() (min, max Value, ok bool) {
+	page.calls++
+	return page.Page.Bounds()
+}
+
+func TestColumnWriterSharesPageBounds(t *testing.T) {
+	type Row struct {
+		Value int64
+	}
+
+	writer := NewWriter(io.Discard, SchemaOf(Row{}))
+	column := writer.ColumnWriters()[0]
+	page := &boundsCountingPage{Page: Int64Type.NewPage(0, 3, encoding.Int64Values([]int64{3, 1, 2}))}
+	defer func() {
+		if column.pageBuffer != nil {
+			column.pool.PutBuffer(column.pageBuffer)
+		}
+	}()
+
+	if _, err := column.writeDataPage(page); err != nil {
+		t.Fatal(err)
+	}
+	if page.calls != 1 {
+		t.Fatalf("Bounds called %d times, want 1", page.calls)
+	}
+	if column.header.page.DataPageHeaderV2.V.Statistics.MinValue == nil {
+		t.Fatal("page statistics are missing bounds")
+	}
+	if column.columnChunk.MetaData.Statistics.MinValue == nil {
+		t.Fatal("column statistics are missing bounds")
+	}
 }
 
 func TestSkipPageStatistics(t *testing.T) {
