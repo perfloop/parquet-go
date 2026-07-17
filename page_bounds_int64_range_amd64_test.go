@@ -11,35 +11,13 @@ import (
 func BenchmarkBoundsInt64DispatchRange(b *testing.B) {
 	for _, numValues := range [...]int{65536, 131071} {
 		b.Run(strconv.Itoa(numValues)+"-values", func(b *testing.B) {
-			values := boundsInt64CutoffValues(numValues)
-			wantMin, wantMax := boundsInt64CutoffOracle(values)
-			b.SetBytes(int64(len(values) * 8))
-
-			var gotMin, gotMax int64
-			for b.Loop() {
-				gotMin, gotMax = boundsInt64(values)
-			}
-			if gotMin != wantMin || gotMax != wantMax {
-				b.Fatalf("boundsInt64 = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
-			}
+			benchmarkBoundsInt64(b, numValues)
 		})
 	}
 }
 
 func BenchmarkBoundsInt64DispatchUpperCutoff(b *testing.B) {
-	const numValues = combinedBoundsThreshold / 8
-
-	values := boundsInt64CutoffValues(numValues)
-	wantMin, wantMax := boundsInt64CutoffOracle(values)
-	b.SetBytes(int64(len(values) * 8))
-
-	var gotMin, gotMax int64
-	for b.Loop() {
-		gotMin, gotMax = boundsInt64(values)
-	}
-	if gotMin != wantMin || gotMax != wantMax {
-		b.Fatalf("boundsInt64 = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
-	}
+	benchmarkBoundsInt64(b, combinedBoundsThreshold/8)
 }
 
 func BenchmarkBoundsInt64WriterDefaultPages(b *testing.B) {

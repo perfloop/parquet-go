@@ -81,20 +81,24 @@ func BenchmarkBoundsInt64WriterPageFill(b *testing.B) {
 		2*combinedBoundsInt64Threshold - 1,
 	} {
 		b.Run(strconv.Itoa(numValues)+"-values", func(b *testing.B) {
-			values := boundsInt64CutoffValues(numValues)
-			rows := boundsInt64PageFillRows(values)
-			b.SetBytes(int64(len(values) * 8))
-
-			for b.Loop() {
-				written, err := writeBoundsInt64PageFill(io.Discard, rows)
-				if err != nil {
-					b.Fatal(err)
-				}
-				if written != len(rows) {
-					b.Fatalf("writer.Write wrote %d rows, want %d", written, len(rows))
-				}
-			}
+			benchmarkBoundsInt64WriterPageFill(b, numValues)
 		})
+	}
+}
+
+func benchmarkBoundsInt64WriterPageFill(b *testing.B, numValues int) {
+	values := boundsInt64CutoffValues(numValues)
+	rows := boundsInt64PageFillRows(values)
+	b.SetBytes(int64(len(values) * 8))
+
+	for b.Loop() {
+		written, err := writeBoundsInt64PageFill(io.Discard, rows)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if written != len(rows) {
+			b.Fatalf("writer.Write wrote %d rows, want %d", written, len(rows))
+		}
 	}
 }
 

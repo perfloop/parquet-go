@@ -1,7 +1,6 @@
 package parquet
 
 import (
-	"io"
 	"math/rand"
 	"strconv"
 	"testing"
@@ -60,18 +59,22 @@ func TestBoundsInt64CombinedCutoff(t *testing.T) {
 func BenchmarkBoundsInt64CombinedCutoff(b *testing.B) {
 	for _, numValues := range [...]int{combinedBoundsInt64Threshold - 1, combinedBoundsInt64Threshold} {
 		b.Run(strconv.Itoa(numValues)+"-values", func(b *testing.B) {
-			values := boundsInt64CutoffValues(numValues)
-			wantMin, wantMax := boundsInt64CutoffOracle(values)
-			b.SetBytes(int64(len(values) * 8))
-
-			var gotMin, gotMax int64
-			for b.Loop() {
-				gotMin, gotMax = boundsInt64(values)
-			}
-			if gotMin != wantMin || gotMax != wantMax {
-				b.Fatalf("boundsInt64 = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
-			}
+			benchmarkBoundsInt64(b, numValues)
 		})
+	}
+}
+
+func benchmarkBoundsInt64(b *testing.B, numValues int) {
+	values := boundsInt64CutoffValues(numValues)
+	wantMin, wantMax := boundsInt64CutoffOracle(values)
+	b.SetBytes(int64(len(values) * 8))
+
+	var gotMin, gotMax int64
+	for b.Loop() {
+		gotMin, gotMax = boundsInt64(values)
+	}
+	if gotMin != wantMin || gotMax != wantMax {
+		b.Fatalf("boundsInt64 = (%d, %d), want (%d, %d)", gotMin, gotMax, wantMin, wantMax)
 	}
 }
 
@@ -80,17 +83,5 @@ type boundsInt64WriterRow struct {
 }
 
 func BenchmarkBoundsInt64WriterDefaultPage(b *testing.B) {
-	values := boundsInt64CutoffValues(combinedBoundsInt64Threshold)
-	rows := boundsInt64PageFillRows(values)
-	b.SetBytes(int64(len(values) * 8))
-
-	for b.Loop() {
-		written, err := writeBoundsInt64PageFill(io.Discard, rows)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if written != len(rows) {
-			b.Fatalf("writer.Write wrote %d rows, want %d", written, len(rows))
-		}
-	}
+	benchmarkBoundsInt64WriterPageFill(b, combinedBoundsInt64Threshold)
 }
