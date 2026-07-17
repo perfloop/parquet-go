@@ -212,6 +212,93 @@ done:
     MOVQ R9, max+32(FP)
     RET
 
+// func combinedBoundsInt64AVX512(data []int64) (min, max int64)
+//
+// boundsInt64 calls this only for a non-empty, >=32-element slice on a host
+// with AVX-512VL. Keep four min/max chains independent so VPMINSQ/VPMAXSQ
+// latency does not serialize the four 512-bit loads in an iteration.
+TEXT ·combinedBoundsInt64AVX512(SB), NOSPLIT, $-40
+    MOVQ data_base+0(FP), AX
+    MOVQ data_len+8(FP), CX
+    XORQ SI, SI
+    MOVQ (AX), R8 // min
+    MOVQ (AX), R9 // max
+
+    MOVQ CX, DI
+    SHRQ $5, DI
+    SHLQ $5, DI
+    VPBROADCASTQ (AX), Z0
+    VPBROADCASTQ (AX), Z1
+    VPBROADCASTQ (AX), Z2
+    VPBROADCASTQ (AX), Z3
+    VPBROADCASTQ (AX), Z4
+    VPBROADCASTQ (AX), Z5
+    VPBROADCASTQ (AX), Z6
+    VPBROADCASTQ (AX), Z7
+loop32:
+    VMOVDQU64 (AX)(SI*8), Z8
+    VMOVDQU64 64(AX)(SI*8), Z9
+    VMOVDQU64 128(AX)(SI*8), Z10
+    VMOVDQU64 192(AX)(SI*8), Z11
+    VPMINSQ Z8, Z0, Z0
+    VPMINSQ Z9, Z1, Z1
+    VPMINSQ Z10, Z2, Z2
+    VPMINSQ Z11, Z3, Z3
+    VPMAXSQ Z8, Z4, Z4
+    VPMAXSQ Z9, Z5, Z5
+    VPMAXSQ Z10, Z6, Z6
+    VPMAXSQ Z11, Z7, Z7
+    ADDQ $32, SI
+    CMPQ SI, DI
+    JNE loop32
+
+    VPMINSQ Z1, Z0, Z0
+    VPMINSQ Z3, Z2, Z2
+    VPMINSQ Z2, Z0, Z0
+    VPMAXSQ Z5, Z4, Z4
+    VPMAXSQ Z7, Z6, Z6
+    VPMAXSQ Z6, Z4, Z4
+
+    VMOVDQU32 swap32+0(SB), Z8
+    VMOVDQU32 swap32+0(SB), Z9
+    VPERMI2D Z0, Z0, Z8
+    VPERMI2D Z4, Z4, Z9
+    VPMINSQ Y8, Y0, Y0
+    VPMAXSQ Y9, Y4, Y4
+
+    VMOVDQU32 swap32+32(SB), Y8
+    VMOVDQU32 swap32+32(SB), Y9
+    VPERMI2D Y0, Y0, Y8
+    VPERMI2D Y4, Y4, Y9
+    VPMINSQ X8, X0, X0
+    VPMAXSQ X9, X4, X4
+
+    VMOVDQU32 swap32+48(SB), X8
+    VMOVDQU32 swap32+48(SB), X9
+    VPERMI2D X0, X0, X8
+    VPERMI2D X4, X4, X9
+    VPMINSQ X8, X0, X0
+    VPMAXSQ X9, X4, X4
+    VZEROUPPER
+
+    MOVQ X0, R8
+    MOVQ X4, R9
+    CMPQ SI, CX
+    JE done
+loop:
+    MOVQ (AX)(SI*8), DX
+    CMPQ DX, R8
+    CMOVQLT DX, R8
+    CMPQ DX, R9
+    CMOVQGT DX, R9
+    INCQ SI
+    CMPQ SI, CX
+    JNE loop
+done:
+    MOVQ R8, min+24(FP)
+    MOVQ R9, max+32(FP)
+    RET
+
 // func combinedBoundsUint32(data []uint32) (min, max uint32)
 TEXT ·combinedBoundsUint32(SB), NOSPLIT, $-32
     MOVQ data_base+0(FP), AX
