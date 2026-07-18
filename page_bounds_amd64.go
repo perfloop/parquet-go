@@ -38,17 +38,10 @@ package parquet
 // to running less instructions per loop. The performance starts to equalize
 // around 256KiB, and degrade beyond 1MiB, so we use this threshold to determine
 // which approach to prefer.
-const combinedBoundsThreshold = 1 * 1024 * 1024
-
-var combinedBoundsInt64Threshold = combinedBoundsThreshold
-
-func init() {
-	// The default writer flushes pages at 98% of DefaultPageBufferSize.
-	// AVX-512 keeps the existing crossover.
-	if !hasAVX512VL {
-		combinedBoundsInt64Threshold = 98 * DefaultPageBufferSize / 100
-	}
-}
+const (
+	combinedBoundsThreshold         = 1 * 1024 * 1024
+	defaultPageBoundsInt64Threshold = 98 * DefaultPageBufferSize / 100
+)
 
 //go:noescape
 func combinedBoundsBool(data []bool) (min, max bool)
@@ -84,7 +77,14 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	if 8*len(data) >= combinedBoundsInt64Threshold {
+	// Keep sub-default pages on the existing min/max fallback before the
+	// AVX-512-specific branch.
+	if 8*len(data) < defaultPageBoundsInt64Threshold {
+		min = minInt64(data)
+		max = maxInt64(data)
+		return
+	}
+	if !hasAVX512VL || 8*len(data) >= combinedBoundsThreshold {
 		return combinedBoundsInt64(data)
 	}
 	min = minInt64(data)
