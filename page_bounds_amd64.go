@@ -74,7 +74,10 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	if 8*len(data) >= combinedBoundsThreshold {
+	// The default writer flushes pages at 98% of DefaultPageBufferSize.
+	// AVX-512 keeps the existing crossover.
+	if 8*len(data) >= 98*DefaultPageBufferSize/100 &&
+		(!hasAVX512VL || 8*len(data) >= combinedBoundsThreshold) {
 		return combinedBoundsInt64(data)
 	}
 	min = minInt64(data)

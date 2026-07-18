@@ -71,6 +71,17 @@ func TestBoundsInt64(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+
+	t.Run("default page", func(t *testing.T) {
+		values := make([]int64, 98*DefaultPageBufferSize/100/8+1)
+		values[0] = -1 << 63
+		values[len(values)-1] = 1<<63 - 1
+
+		min, max := boundsInt64(values)
+		if min != values[0] || max != values[len(values)-1] {
+			t.Errorf("boundsInt64 returned (%d, %d), want (%d, %d)", min, max, values[0], values[len(values)-1])
+		}
+	})
 }
 
 func TestBoundsUint32(t *testing.T) {
