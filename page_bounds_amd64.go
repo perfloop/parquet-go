@@ -40,6 +40,16 @@ package parquet
 // which approach to prefer.
 const combinedBoundsThreshold = 1 * 1024 * 1024
 
+var combinedBoundsInt64Threshold = combinedBoundsThreshold
+
+func init() {
+	// The default writer flushes pages at 98% of DefaultPageBufferSize.
+	// AVX-512 keeps the existing crossover.
+	if !hasAVX512VL {
+		combinedBoundsInt64Threshold = 98 * DefaultPageBufferSize / 100
+	}
+}
+
 //go:noescape
 func combinedBoundsBool(data []bool) (min, max bool)
 
@@ -74,10 +84,7 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	// The default writer flushes pages at 98% of DefaultPageBufferSize.
-	// AVX-512 keeps the existing crossover.
-	if 8*len(data) >= 98*DefaultPageBufferSize/100 &&
-		(!hasAVX512VL || 8*len(data) >= combinedBoundsThreshold) {
+	if 8*len(data) >= combinedBoundsInt64Threshold {
 		return combinedBoundsInt64(data)
 	}
 	min = minInt64(data)
