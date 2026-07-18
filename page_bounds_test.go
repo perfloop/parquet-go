@@ -82,6 +82,57 @@ func TestBoundsInt64(t *testing.T) {
 			t.Errorf("boundsInt64 returned (%d, %d), want (%d, %d)", min, max, values[0], values[len(values)-1])
 		}
 	})
+
+	t.Run("default writer page", func(t *testing.T) {
+		type row struct{ Value int64 }
+
+		const minValue = -1 << 63
+		const maxValue = 1<<63 - 1
+
+		rows := make([]row, 98*DefaultPageBufferSize/100/8+1)
+		for i := range rows {
+			rows[i].Value = int64(i)
+		}
+		rows[0].Value = minValue
+		rows[len(rows)-1].Value = maxValue
+
+		buffer := new(bytes.Buffer)
+		writer := NewGenericWriter[row](buffer, PageBufferSize(DefaultPageBufferSize))
+		if n, err := writer.Write(rows); err != nil {
+			t.Fatal(err)
+		} else if n != len(rows) {
+			t.Fatalf("writer wrote %d rows, want %d", n, len(rows))
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		reader := bytes.NewReader(buffer.Bytes())
+		file, err := OpenFile(reader, reader.Size())
+		if err != nil {
+			t.Fatal(err)
+		}
+		index, err := file.RowGroups()[0].ColumnChunks()[0].ColumnIndex()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index.NumPages() == 0 {
+			t.Fatal("column index has no pages")
+		}
+
+		min, max := index.MinValue(0).Int64(), index.MaxValue(0).Int64()
+		for i := 1; i < index.NumPages(); i++ {
+			if value := index.MinValue(i).Int64(); value < min {
+				min = value
+			}
+			if value := index.MaxValue(i).Int64(); value > max {
+				max = value
+			}
+		}
+		if min != minValue || max != maxValue {
+			t.Errorf("writer page bounds returned (%d, %d), want (%d, %d)", min, max, minValue, maxValue)
+		}
+	})
 }
 
 func TestBoundsUint32(t *testing.T) {
