@@ -213,20 +213,12 @@ done:
     RET
 
 // func combinedBoundsInt64AVX512(data []int64) (min, max int64)
+// boundsInt64 calls this only for default-sized pages, so the vector loop
+// always executes.
 TEXT ·combinedBoundsInt64AVX512(SB), NOSPLIT, $-40
     MOVQ data_base+0(FP), AX
     MOVQ data_len+8(FP), CX
-    XORQ R8, R8
-    XORQ R9, R9
-
-    CMPQ CX, $0
-    JE done
     XORQ SI, SI
-    MOVQ (AX), R8 // min
-    MOVQ (AX), R9 // max
-
-    CMPQ CX, $16
-    JB loop
 
     MOVQ CX, DI
     SHRQ $4, DI

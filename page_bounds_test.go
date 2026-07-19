@@ -71,6 +71,31 @@ func TestBoundsInt64(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+
+	const defaultPageLength = (DefaultPageBufferSize*98/100+7)/8 + 7
+	testBounds := func(t *testing.T, length, minIndex, maxIndex int) {
+		t.Helper()
+		values := make([]int64, length)
+		values[minIndex] = -1 << 63
+		values[maxIndex] = 1<<63 - 1
+
+		min, max := boundsInt64(values)
+		if min != -1<<63 || max != 1<<63-1 {
+			t.Fatalf("boundsInt64() = (%d, %d), want (%d, %d)", min, max, int64(-1<<63), int64(1<<63-1))
+		}
+	}
+
+	for offset := range 16 {
+		t.Run(fmt.Sprintf("default-page/vector-lane-%d", offset), func(t *testing.T) {
+			testBounds(t, defaultPageLength, 16+offset, 32+offset)
+		})
+	}
+	t.Run("default-page/scalar-tail", func(t *testing.T) {
+		testBounds(t, defaultPageLength, defaultPageLength-2, defaultPageLength-1)
+	})
+	t.Run("default-page/buffer-limit", func(t *testing.T) {
+		testBounds(t, DefaultPageBufferSize/8, 8, 15)
+	})
 }
 
 func TestBoundsUint32(t *testing.T) {

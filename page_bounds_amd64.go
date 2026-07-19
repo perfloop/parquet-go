@@ -43,6 +43,7 @@ const (
 
 	// ColumnWriter flushes default pages at 98% of DefaultPageBufferSize.
 	combinedBoundsInt64AVX512Threshold = DefaultPageBufferSize * 98 / 100
+	combinedBoundsInt64AVX512Limit     = DefaultPageBufferSize
 )
 
 //go:noescape
@@ -85,7 +86,9 @@ func boundsInt64(data []int64) (min, max int64) {
 	if 8*len(data) >= combinedBoundsThreshold {
 		return combinedBoundsInt64(data)
 	}
-	if hasAVX512VL && 8*len(data) >= combinedBoundsInt64AVX512Threshold {
+	if hasAVX512VL &&
+		8*len(data) >= combinedBoundsInt64AVX512Threshold &&
+		8*len(data) <= combinedBoundsInt64AVX512Limit {
 		return combinedBoundsInt64AVX512(data)
 	}
 	min = minInt64(data)
