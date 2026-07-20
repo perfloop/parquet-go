@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/parquet-go/parquet-go/internal/memory"
 	"github.com/parquet-go/parquet-go/internal/quick"
 )
 
@@ -72,28 +73,61 @@ func TestBoundsInt64(t *testing.T) {
 		t.Error(err)
 	}
 
-	const defaultPageLength = (DefaultPageBufferSize*98/100+7)/8 + 7
-	testBounds := func(t *testing.T, length, minIndex, maxIndex int) {
+	threshold := DefaultPageBufferSize * 98 / 100
+	firstInWindow := (threshold + 7) / 8
+	if 8*(firstInWindow-1) >= threshold || 8*firstInWindow < threshold {
+		t.Fatalf("first in-window length = %d does not bracket threshold %d", firstInWindow, threshold)
+	}
+
+	testBounds := func(t *testing.T, n, minIndex, maxIndex int) {
 		t.Helper()
-		values := make([]int64, length)
+
+		values := make([]int64, n)
+		for i := range values {
+			values[i] = int64(i + 1)
+		}
 		values[minIndex] = -1 << 63
 		values[maxIndex] = 1<<63 - 1
 
-		min, max := boundsInt64(values)
-		if min != -1<<63 || max != 1<<63-1 {
-			t.Fatalf("boundsInt64() = (%d, %d), want (%d, %d)", min, max, int64(-1<<63), int64(1<<63-1))
+		wantMin, wantMax := values[0], values[0]
+		for _, value := range values[1:] {
+			if value < wantMin {
+				wantMin = value
+			}
+			if value > wantMax {
+				wantMax = value
+			}
+		}
+
+		page := int64Page{values: memory.SliceBufferFrom(values)}
+		gotMin, gotMax, ok := page.Bounds()
+		if !ok {
+			t.Fatal("Bounds returned no values")
+		}
+		if got := gotMin.Int64(); got != wantMin {
+			t.Fatalf("Bounds min = %d, want %d", got, wantMin)
+		}
+		if got := gotMax.Int64(); got != wantMax {
+			t.Fatalf("Bounds max = %d, want %d", got, wantMax)
 		}
 	}
 
-	for offset := range 16 {
-		t.Run(fmt.Sprintf("default-page/vector-lane-%d", offset), func(t *testing.T) {
-			testBounds(t, defaultPageLength, 16+offset, 32+offset)
-		})
-	}
-	t.Run("default-page/scalar-tail", func(t *testing.T) {
-		testBounds(t, defaultPageLength, defaultPageLength-2, defaultPageLength-1)
+	t.Run("selected-page/lower-dispatch-boundary", func(t *testing.T) {
+		for lane := range 16 {
+			t.Run(fmt.Sprintf("vector-lane-%d", lane), func(t *testing.T) {
+				testBounds(t, firstInWindow, 16+lane, 32+lane)
+			})
+		}
 	})
-	t.Run("default-page/buffer-limit", func(t *testing.T) {
+
+	tailLength := firstInWindow
+	for tailLength%16 < 2 {
+		tailLength++
+	}
+	t.Run("selected-page/scalar-tail", func(t *testing.T) {
+		testBounds(t, tailLength, tailLength-2, tailLength-1)
+	})
+	t.Run("selected-page/upper-dispatch-cap", func(t *testing.T) {
 		testBounds(t, DefaultPageBufferSize/8, 8, 15)
 	})
 }

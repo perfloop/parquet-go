@@ -48,7 +48,7 @@ func (page *int64Page) min() int64 { return minInt64(page.values.Slice()) }
 
 func (page *int64Page) max() int64 { return maxInt64(page.values.Slice()) }
 
-func (page *int64Page) bounds() (min, max int64) { return boundsInt64ForPage(page.values.Slice()) }
+func (page *int64Page) bounds() (min, max int64) { return boundsInt64(page.values.Slice()) }
 
 func (page *int64Page) Bounds() (min, max Value, ok bool) {
 	if ok = page.values.Len() > 0; ok {
