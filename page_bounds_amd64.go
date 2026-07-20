@@ -82,18 +82,31 @@ func boundsInt32(data []int32) (min, max int32) {
 	return
 }
 
+// boundsInt64ForPage is selected once after CPU detection so the retained
+// non-AVX-512 fallback uses the original boundsInt64 path.
+var boundsInt64ForPage = boundsInt64
+
+func init() {
+	if hasAVX512VL {
+		boundsInt64ForPage = boundsInt64AVX512
+	}
+}
+
 func boundsInt64(data []int64) (min, max int64) {
 	if 8*len(data) >= combinedBoundsThreshold {
 		return combinedBoundsInt64(data)
 	}
-	if hasAVX512VL &&
-		8*len(data) >= combinedBoundsInt64AVX512Threshold &&
-		8*len(data) <= combinedBoundsInt64AVX512Limit {
-		return combinedBoundsInt64AVX512(data)
-	}
 	min = minInt64(data)
 	max = maxInt64(data)
 	return
+}
+
+func boundsInt64AVX512(data []int64) (min, max int64) {
+	if 8*len(data) >= combinedBoundsInt64AVX512Threshold &&
+		8*len(data) <= combinedBoundsInt64AVX512Limit {
+		return combinedBoundsInt64AVX512(data)
+	}
+	return boundsInt64(data)
 }
 
 func boundsUint32(data []uint32) (min, max uint32) {
