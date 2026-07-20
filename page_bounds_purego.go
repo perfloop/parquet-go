@@ -23,8 +23,6 @@ func boundsInt32(data []int32) (min, max int32) {
 	return min, max
 }
 
-var boundsInt64 = boundsInt64Default
-
 func boundsInt64Default(data []int64) (min, max int64) {
 	if len(data) > 0 {
 		min = data[0]
@@ -41,6 +39,8 @@ func boundsInt64Default(data []int64) (min, max int64) {
 	}
 	return min, max
 }
+
+func boundsInt64ForPage(data []int64) (min, max int64) { return boundsInt64Default(data) }
 
 func boundsUint32(data []uint32) (min, max uint32) {
 	if len(data) > 0 {

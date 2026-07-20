@@ -132,6 +132,10 @@ func TestBoundsInt64(t *testing.T) {
 	})
 }
 
+// boundsInt64 keeps test-only direct callers on the implementation selected by
+// int64Page.bounds. Production callers use boundsInt64ForPage directly.
+func boundsInt64(data []int64) (min, max int64) { return boundsInt64ForPage(data) }
+
 func TestBoundsUint32(t *testing.T) {
 	err := quick.Check(func(values []uint32) bool {
 		min := uint32(0)

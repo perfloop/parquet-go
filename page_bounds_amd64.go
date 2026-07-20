@@ -82,14 +82,14 @@ func boundsInt32(data []int32) (min, max int32) {
 	return
 }
 
-// boundsInt64 is selected once after CPU detection so the retained
-// non-AVX-512 fallback uses the original implementation without a per-call
-// feature check.
-var boundsInt64 = boundsInt64Default
+// boundsInt64ForPage is selected once after CPU detection. AVX-512VL hosts
+// use the default-page window wrapper; other amd64 hosts select the original
+// implementation.
+var boundsInt64ForPage = boundsInt64Default
 
 func init() {
 	if hasAVX512VL {
-		boundsInt64 = boundsInt64AVX512
+		boundsInt64ForPage = boundsInt64AVX512
 	}
 }
 
