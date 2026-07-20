@@ -216,17 +216,7 @@ done:
 TEXT ·combinedBoundsInt64AVX512(SB), NOSPLIT, $-40
     MOVQ data_base+0(FP), AX
     MOVQ data_len+8(FP), CX
-    XORQ R8, R8
-    XORQ R9, R9
-
-    CMPQ CX, $0
-    JE done
     XORQ SI, SI
-    MOVQ (AX), R8 // min
-    MOVQ (AX), R9 // max
-
-    CMPQ CX, $32
-    JB loop
 
     MOVQ CX, DI
     SHRQ $5, DI
