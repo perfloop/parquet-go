@@ -38,7 +38,13 @@ package parquet
 // to running less instructions per loop. The performance starts to equalize
 // around 256KiB, and degrade beyond 1MiB, so we use this threshold to determine
 // which approach to prefer.
-const combinedBoundsThreshold = 1 * 1024 * 1024
+//
+// Column page buffers flush at 98% of their configured capacity, so the AVX-512
+// floor includes the default-size INT64 pages before they take separate scans.
+const (
+	combinedBoundsThreshold        = 1 * 1024 * 1024
+	combinedBoundsInt64AVX512Floor = 98 * DefaultPageBufferSize / 100
+)
 
 //go:noescape
 func combinedBoundsBool(data []bool) (min, max bool)
@@ -48,6 +54,9 @@ func combinedBoundsInt32(data []int32) (min, max int32)
 
 //go:noescape
 func combinedBoundsInt64(data []int64) (min, max int64)
+
+//go:noescape
+func combinedBoundsInt64AVX512(data []int64) (min, max int64)
 
 //go:noescape
 func combinedBoundsUint32(data []uint32) (min, max uint32)
@@ -74,7 +83,11 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	if 8*len(data) >= combinedBoundsThreshold {
+	size := 8 * len(data)
+	if hasAVX512VL && size >= combinedBoundsInt64AVX512Floor && size < combinedBoundsThreshold {
+		return combinedBoundsInt64AVX512(data)
+	}
+	if size >= combinedBoundsThreshold {
 		return combinedBoundsInt64(data)
 	}
 	min = minInt64(data)
