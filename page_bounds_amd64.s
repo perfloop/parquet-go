@@ -212,6 +212,91 @@ done:
     MOVQ R9, max+32(FP)
     RET
 
+// func combinedBoundsInt64AVX512(data []int64) (min, max int64)
+TEXT ·combinedBoundsInt64AVX512(SB), NOSPLIT, $-40
+    MOVQ data_base+0(FP), AX
+    MOVQ data_len+8(FP), CX
+    XORQ R8, R8
+    XORQ R9, R9
+
+    CMPQ CX, $0
+    JE done
+    XORQ SI, SI
+    MOVQ (AX), R8 // min
+    MOVQ (AX), R9 // max
+
+    CMPQ CX, $32
+    JB loop
+
+    MOVQ CX, DI
+    SHRQ $5, DI
+    SHLQ $5, DI
+    // Keep two independent min and max chains to hide the AVX-512
+    // min/max latency while scanning four vectors per iteration.
+    VPBROADCASTQ (AX), Z0 // min even
+    VPBROADCASTQ (AX), Z1 // min odd
+    VPBROADCASTQ (AX), Z2 // max even
+    VPBROADCASTQ (AX), Z3 // max odd
+loop32:
+    VMOVDQU64 (AX)(SI*8), Z4
+    VMOVDQU64 64(AX)(SI*8), Z5
+    VMOVDQU64 128(AX)(SI*8), Z6
+    VMOVDQU64 192(AX)(SI*8), Z7
+    VPMINSQ Z4, Z0, Z0
+    VPMINSQ Z5, Z1, Z1
+    VPMAXSQ Z4, Z2, Z2
+    VPMAXSQ Z5, Z3, Z3
+    VPMINSQ Z6, Z0, Z0
+    VPMINSQ Z7, Z1, Z1
+    VPMAXSQ Z6, Z2, Z2
+    VPMAXSQ Z7, Z3, Z3
+    ADDQ $32, SI
+    CMPQ SI, DI
+    JNE loop32
+
+    VPMINSQ Z1, Z0, Z0
+    VPMAXSQ Z3, Z2, Z2
+
+    VMOVDQU32 swap32+0(SB), Z1
+    VMOVDQU32 swap32+0(SB), Z3
+    VPERMI2D Z0, Z0, Z1
+    VPERMI2D Z2, Z2, Z3
+    VPMINSQ Y1, Y0, Y0
+    VPMAXSQ Y3, Y2, Y2
+
+    VMOVDQU32 swap32+32(SB), Y1
+    VMOVDQU32 swap32+32(SB), Y3
+    VPERMI2D Y0, Y0, Y1
+    VPERMI2D Y2, Y2, Y3
+    VPMINSQ X1, X0, X0
+    VPMAXSQ X3, X2, X2
+
+    VMOVDQU32 swap32+48(SB), X1
+    VMOVDQU32 swap32+48(SB), X3
+    VPERMI2D X0, X0, X1
+    VPERMI2D X2, X2, X3
+    VPMINSQ X1, X0, X0
+    VPMAXSQ X3, X2, X2
+    VZEROUPPER
+
+    MOVQ X0, R8
+    MOVQ X2, R9
+    CMPQ SI, CX
+    JE done
+loop:
+    MOVQ (AX)(SI*8), DX
+    CMPQ DX, R8
+    CMOVQLT DX, R8
+    CMPQ DX, R9
+    CMOVQGT DX, R9
+    INCQ SI
+    CMPQ SI, CX
+    JNE loop
+done:
+    MOVQ R8, min+24(FP)
+    MOVQ R9, max+32(FP)
+    RET
+
 // func combinedBoundsUint32(data []uint32) (min, max uint32)
 TEXT ·combinedBoundsUint32(SB), NOSPLIT, $-32
     MOVQ data_base+0(FP), AX
