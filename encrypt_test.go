@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -782,6 +783,255 @@ func TestEncryptionPageIndexEncrypted(t *testing.T) {
 		}
 		if bytes.Contains(data, le[:]) {
 			t.Errorf("file bytes contain plaintext little-endian encoding of column statistic %d — page index is not encrypted", want)
+		}
+	}
+}
+
+type encryptedByteArrayTestRow struct {
+	Value []byte `parquet:"value"`
+}
+
+func writeEncryptedByteArrayFile(t *testing.T, keyByte byte, values ...[]byte) []byte {
+	t.Helper()
+
+	key := aes128Key(keyByte)
+	cfg := &parquet.EncryptionConfig{
+		FooterKey:       key,
+		EncryptedFooter: true,
+		FileIdentifier:  []byte{keyByte, 1, 2, 3, 4, 5, 6, 7},
+	}
+	rows := make([]encryptedByteArrayTestRow, len(values))
+	for i := range values {
+		rows[i].Value = values[i]
+	}
+
+	var data bytes.Buffer
+	writer := parquet.NewGenericWriter[encryptedByteArrayTestRow](&data,
+		parquet.WithEncryption(cfg),
+		parquet.PageBufferSize(4*1024),
+		parquet.DefaultEncoding(&parquet.Plain),
+	)
+	if _, err := writer.Write(rows); err != nil {
+		t.Fatalf("write encrypted byte-array page: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close encrypted byte-array writer: %v", err)
+	}
+	return data.Bytes()
+}
+
+func writeEncryptedCompressedDictionary(t *testing.T, keyByte byte, value []byte) []byte {
+	t.Helper()
+
+	key := aes128Key(keyByte)
+	cfg := &parquet.EncryptionConfig{
+		FooterKey:       key,
+		EncryptedFooter: true,
+		FileIdentifier:  []byte{keyByte, 8, 7, 6, 5, 4, 3, 2},
+	}
+
+	var data bytes.Buffer
+	writer := parquet.NewGenericWriter[encryptedByteArrayTestRow](&data,
+		parquet.WithEncryption(cfg),
+		parquet.PageBufferSize(4*1024),
+		parquet.DefaultEncodingFor(parquet.ByteArray, &parquet.RLEDictionary),
+		parquet.Compression(&parquet.Gzip),
+	)
+	if _, err := writer.Write([]encryptedByteArrayTestRow{{Value: value}}); err != nil {
+		t.Fatalf("write encrypted dictionary page: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close encrypted dictionary writer: %v", err)
+	}
+	return data.Bytes()
+}
+
+func encryptedFilePages(t *testing.T, data []byte, keyByte byte) *parquet.FilePages {
+	t.Helper()
+
+	file, err := parquet.OpenFile(
+		bytes.NewReader(data),
+		int64(len(data)),
+		parquet.WithDecryption(&staticKeyRetriever{footerKey: aes128Key(keyByte)}),
+	)
+	if err != nil {
+		t.Fatalf("open encrypted file: %v", err)
+	}
+	pages, ok := file.RowGroups()[0].ColumnChunks()[0].Pages().(*parquet.FilePages)
+	if !ok {
+		t.Fatal("encrypted column did not return FilePages")
+	}
+	return pages
+}
+
+func TestEncryptedPageReuseDoesNotExposePriorPlaintext(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
+
+	sentinel := []byte("victim-decrypted-page-secret")
+	secret := append(bytes.Repeat([]byte("x"), 3*1024), sentinel...)
+	victimData := writeEncryptedByteArrayFile(t, 0xD3, secret)
+	attackerValue := []byte("attacker-controlled")
+	attackerData := writeEncryptedByteArrayFile(t, 0xD4, attackerValue)
+
+	// Drop unrelated writer buffers so the attacker only races the released
+	// decrypted page body below, not setup allocations from constructing files.
+	runtime.GC()
+	runtime.GC()
+
+	victimPages := encryptedFilePages(t, victimData, 0xD3)
+	victim, err := victimPages.ReadPage()
+	if err != nil {
+		t.Fatalf("read victim page: %v", err)
+	}
+	victimValues := victim.Data()
+	victimPlaintext, _ := victimValues.Data()
+	if !bytes.Contains(victimPlaintext, sentinel) {
+		t.Fatal("victim page did not contain its plaintext sentinel")
+	}
+	parquet.Release(victim)
+	if err := victimPages.Close(); err != nil {
+		t.Fatalf("close victim pages: %v", err)
+	}
+
+	for range 512 {
+		attackerPages := encryptedFilePages(t, attackerData, 0xD4)
+		attacker, err := attackerPages.ReadPage()
+		if err != nil {
+			t.Fatalf("read attacker page: %v", err)
+		}
+
+		attackerValues := attacker.Data()
+		attackerPlaintext, offsets := attackerValues.Data()
+		if len(offsets) != 2 || !bytes.Equal(attackerPlaintext, attackerValue) {
+			t.Fatal("attacker page did not decode its own plaintext")
+		}
+		if suffix := attackerPlaintext[len(attackerPlaintext):cap(attackerPlaintext)]; bytes.Contains(suffix, sentinel) {
+			t.Fatal("attacker page exposed plaintext from separately keyed victim file")
+		}
+
+		parquet.Release(attacker)
+		if err := attackerPages.Close(); err != nil {
+			t.Fatalf("close attacker pages: %v", err)
+		}
+	}
+}
+
+func TestEncryptedCompressedDictionaryReuseDoesNotExposePriorPlaintext(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
+
+	sentinel := []byte("victim-compressed-dictionary-secret")
+	secret := append(bytes.Repeat([]byte("y"), 3*1024), sentinel...)
+	victimData := writeEncryptedCompressedDictionary(t, 0xD5, secret)
+	attackerValue := []byte("attacker-controlled")
+	attackerData := writeEncryptedByteArrayFile(t, 0xD6, attackerValue)
+
+	// Drop unrelated writer buffers so the attacker only races decrypted
+	// dictionary buffers released by ReadDictionary below.
+	runtime.GC()
+	runtime.GC()
+
+	victimPages := encryptedFilePages(t, victimData, 0xD5)
+	dictionary, err := victimPages.ReadDictionary()
+	if err != nil {
+		t.Fatalf("read victim dictionary: %v", err)
+	}
+	if dictionary == nil {
+		t.Fatal("encrypted dictionary was not available")
+	}
+	if got := dictionary.Index(0).ByteArray(); !bytes.Equal(got, secret) {
+		t.Fatal("victim dictionary did not contain its plaintext sentinel")
+	}
+	if err := victimPages.Close(); err != nil {
+		t.Fatalf("close victim pages: %v", err)
+	}
+
+	for range 512 {
+		attackerPages := encryptedFilePages(t, attackerData, 0xD6)
+		attacker, err := attackerPages.ReadPage()
+		if err != nil {
+			t.Fatalf("read attacker page: %v", err)
+		}
+
+		attackerValues := attacker.Data()
+		attackerPlaintext, offsets := attackerValues.Data()
+		if len(offsets) != 2 || !bytes.Equal(attackerPlaintext, attackerValue) {
+			t.Fatal("attacker page did not decode its own plaintext")
+		}
+		if suffix := attackerPlaintext[len(attackerPlaintext):cap(attackerPlaintext)]; bytes.Contains(suffix, sentinel) {
+			t.Fatal("attacker page exposed plaintext from separately keyed victim dictionary")
+		}
+
+		parquet.Release(attacker)
+		if err := attackerPages.Close(); err != nil {
+			t.Fatalf("close attacker pages: %v", err)
+		}
+	}
+}
+
+func TestEncryptedPageReuseDoesNotExposePriorOffsets(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
+
+	victimValues := make([][]byte, 64)
+	for i := range victimValues {
+		victimValues[i] = bytes.Repeat([]byte{byte(i + 1)}, i+1)
+	}
+	victimData := writeEncryptedByteArrayFile(t, 0xD8, victimValues...)
+	// Keep this one-value attacker in the next byte-buffer size class so its
+	// raw body cannot consume the victim's 4 KiB offsets allocation first.
+	attackerValue := bytes.Repeat([]byte("a"), 5*1024)
+	attackerData := writeEncryptedByteArrayFile(t, 0xD9, attackerValue)
+
+	// Drop unrelated writer buffers so the attacker only races the released
+	// byte-array offsets below, not setup allocations from constructing files.
+	runtime.GC()
+	runtime.GC()
+
+	victimPages := encryptedFilePages(t, victimData, 0xD8)
+	victim, err := victimPages.ReadPage()
+	if err != nil {
+		t.Fatalf("read victim page: %v", err)
+	}
+	victimDataValues := victim.Data()
+	_, victimOffsets := victimDataValues.Data()
+	if len(victimOffsets) != len(victimValues)+1 {
+		t.Fatalf("victim page has %d offsets, want %d", len(victimOffsets), len(victimValues)+1)
+	}
+	privateOffset := victimOffsets[len(victimOffsets)-1]
+	if privateOffset == uint32(len(attackerValue)) {
+		t.Fatal("victim offset was not distinct from attacker data")
+	}
+	parquet.Release(victim)
+	if err := victimPages.Close(); err != nil {
+		t.Fatalf("close victim pages: %v", err)
+	}
+
+	for range 512 {
+		attackerPages := encryptedFilePages(t, attackerData, 0xD9)
+		attacker, err := attackerPages.ReadPage()
+		if err != nil {
+			t.Fatalf("read attacker page: %v", err)
+		}
+
+		attackerDataValues := attacker.Data()
+		attackerPlaintext, attackerOffsets := attackerDataValues.Data()
+		if !bytes.Equal(attackerPlaintext, attackerValue) {
+			t.Fatal("attacker page did not decode its own plaintext")
+		}
+		if len(attackerOffsets) != 2 {
+			t.Fatalf("attacker page has %d offsets, want 2", len(attackerOffsets))
+		}
+		for _, offset := range attackerOffsets[len(attackerOffsets):cap(attackerOffsets)] {
+			if offset == privateOffset {
+				t.Fatal("attacker page exposed offsets from separately keyed victim file")
+			}
+		}
+
+		parquet.Release(attacker)
+		if err := attackerPages.Close(); err != nil {
+			t.Fatalf("close attacker pages: %v", err)
 		}
 	}
 }

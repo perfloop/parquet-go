@@ -2,9 +2,11 @@ package parquet
 
 import (
 	"math"
+	"runtime"
 	"testing"
 
 	"github.com/parquet-go/parquet-go/deprecated"
+	"github.com/parquet-go/parquet-go/encoding/rle"
 	"github.com/parquet-go/parquet-go/encoding/thrift"
 	"github.com/parquet-go/parquet-go/format"
 	"slices"
@@ -548,5 +550,25 @@ func TestSchemaElementTypePreservesUncanonicalValues(t *testing.T) {
 				t.Errorf("logical type = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestDecodeLevelsClearsBufferOnError(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
+
+	// Clear prior pool state, then decode one complete RLE run followed by a
+	// truncated header. The decoder writes the first level before failing.
+	runtime.GC()
+	runtime.GC()
+	_, err := decodeLevels(&rle.Encoding{BitWidth: 1}, 64, []byte{2, 1, 0x80}, true)
+	if err == nil {
+		t.Fatal("decoding truncated levels succeeded")
+	}
+
+	reused := buffers.get(64)
+	defer reused.unref()
+	if got := reused.data.Slice()[0]; got != 0 {
+		t.Fatalf("reused level buffer retained decoded value %d after error", got)
 	}
 }
