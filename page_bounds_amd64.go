@@ -42,7 +42,8 @@ const (
 	combinedBoundsThreshold = 1 * 1024 * 1024
 	// ColumnWriter fills pages to 98% of DefaultPageBufferSize. This is the
 	// first whole INT64 value count that reaches that default page target.
-	combinedBoundsInt64Threshold = (DefaultPageBufferSize*98/100 + 7) / 8
+	combinedBoundsInt64Threshold      = (DefaultPageBufferSize*98/100 + 7) / 8
+	combinedBoundsInt64UpperThreshold = combinedBoundsThreshold / 8
 )
 
 //go:noescape
@@ -82,17 +83,16 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	if len(data) >= combinedBoundsInt64Threshold {
-		if hasAVX512VL && 8*len(data) < combinedBoundsThreshold {
-			return combinedBoundsInt64AVX512(data)
-		}
-		if 8*len(data) >= combinedBoundsThreshold {
-			return combinedBoundsInt64(data)
-		}
+	switch n := len(data); {
+	case n >= combinedBoundsInt64UpperThreshold:
+		return combinedBoundsInt64(data)
+	case n >= combinedBoundsInt64Threshold && hasAVX512VL:
+		return combinedBoundsInt64AVX512(data)
+	default:
+		min = minInt64(data)
+		max = maxInt64(data)
+		return
 	}
-	min = minInt64(data)
-	max = maxInt64(data)
-	return
 }
 
 func boundsUint32(data []uint32) (min, max uint32) {
