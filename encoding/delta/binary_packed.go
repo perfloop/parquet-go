@@ -140,10 +140,15 @@ func encodeInt64Default(dst []byte, src []int64) []byte {
 		block := [blockSize]int64{}
 		blockLength := copy(block[:], src[i:])
 
-		lastValue = blockDeltaInt64(&block, lastValue)
-		minDelta := blockMinInt64(&block)
-		blockSubInt64(&block, minDelta)
-		blockClearInt64(&block, blockLength)
+		var minDelta int64
+		if blockLength < blockSize {
+			lastValue, minDelta = blockDeltaMinSubInt64Partial(&block, lastValue, blockLength)
+		} else {
+			lastValue = blockDeltaInt64(&block, lastValue)
+			minDelta = blockMinInt64(&block)
+			blockSubInt64(&block, minDelta)
+			blockClearInt64(&block, blockLength)
+		}
 
 		bitWidths := [numMiniBlocks]byte{}
 		blockBitWidthsInt64(&bitWidths, &block)
@@ -258,6 +263,25 @@ func blockSubInt64(block *[blockSize]int64, value int64) {
 	for i := range block {
 		block[i] -= value
 	}
+}
+
+func blockDeltaMinSubInt64Partial(block *[blockSize]int64, lastValue int64, blockLength int) (int64, int64) {
+	for i, v := range block[:blockLength] {
+		block[i], lastValue = v-lastValue, v
+	}
+
+	minDelta := block[0]
+	for _, v := range block[1:blockLength] {
+		if v < minDelta {
+			minDelta = v
+		}
+	}
+
+	for i := range block[:blockLength] {
+		block[i] -= minDelta
+	}
+
+	return lastValue, minDelta
 }
 
 func blockBitWidthsInt64(bitWidths *[numMiniBlocks]byte, block *[blockSize]int64) {
