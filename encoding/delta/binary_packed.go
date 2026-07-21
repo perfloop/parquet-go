@@ -147,7 +147,6 @@ func encodeInt64Default(dst []byte, src []int64) []byte {
 			lastValue = blockDeltaInt64(&block, lastValue)
 			minDelta = blockMinInt64(&block)
 			blockSubInt64(&block, minDelta)
-			blockClearInt64(&block, blockLength)
 		}
 
 		bitWidths := [numMiniBlocks]byte{}
@@ -230,15 +229,6 @@ func blockBitWidthsInt32(bitWidths *[numMiniBlocks]byte, block *[blockSize]int32
 		}
 
 		bitWidths[i] = byte(bitWidth)
-	}
-}
-
-func blockClearInt64(block *[blockSize]int64, blockLength int) {
-	if blockLength < blockSize {
-		clear := block[blockLength:]
-		for i := range clear {
-			clear[i] = 0
-		}
 	}
 }
 

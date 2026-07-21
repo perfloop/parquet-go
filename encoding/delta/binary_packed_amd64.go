@@ -174,7 +174,6 @@ func encodeInt64AVX2(dst []byte, src []int64) []byte {
 			lastValue = blockDeltaInt64AVX2(&block, lastValue)
 			minDelta = blockMinInt64AVX2(&block)
 			blockSubInt64AVX2(&block, minDelta)
-			blockClearInt64(&block, blockLength)
 		}
 
 		bitWidths := [numMiniBlocks]byte{}
