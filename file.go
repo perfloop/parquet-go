@@ -1536,7 +1536,6 @@ func (f *FilePages) readEncryptedPage() (*format.PageHeader, *buffer[byte], erro
 
 	page := buffers.get(len(bodyPlain))
 	copy(page.data.Slice(), bodyPlain)
-	page.ref()
 
 	if isDictPage {
 		d.dictPagePending = false
