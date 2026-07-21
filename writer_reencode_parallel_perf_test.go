@@ -124,7 +124,7 @@ func newReencodeTraceSource(t testing.TB) ([]copyTestRow, *File, *reencodeTraceR
 	return rows, file, reader
 }
 
-func rewriteReencodeTrace(t testing.TB, file *File, rows []copyTestRow, options ...WriterOption) []byte {
+func rewriteReencodeTrace(t *testing.T, file *File, rows []copyTestRow, options ...WriterOption) []byte {
 	t.Helper()
 
 	var output bytes.Buffer
