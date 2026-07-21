@@ -38,7 +38,10 @@ package parquet
 // to running less instructions per loop. The performance starts to equalize
 // around 256KiB, and degrade beyond 1MiB, so we use this threshold to determine
 // which approach to prefer.
-const combinedBoundsThreshold = 1 * 1024 * 1024
+const (
+	combinedBoundsThreshold      = 1 * 1024 * 1024
+	combinedBoundsInt64Threshold = 32113 // First INT64 page to exceed the default 98%-of-256KiB buffer target.
+)
 
 //go:noescape
 func combinedBoundsBool(data []bool) (min, max bool)
@@ -48,6 +51,9 @@ func combinedBoundsInt32(data []int32) (min, max int32)
 
 //go:noescape
 func combinedBoundsInt64(data []int64) (min, max int64)
+
+//go:noescape
+func combinedBoundsInt64AVX512(data []int64) (min, max int64)
 
 //go:noescape
 func combinedBoundsUint32(data []uint32) (min, max uint32)
@@ -74,6 +80,9 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
+	if hasAVX512VL && len(data) >= combinedBoundsInt64Threshold && 8*len(data) < combinedBoundsThreshold {
+		return combinedBoundsInt64AVX512(data)
+	}
 	if 8*len(data) >= combinedBoundsThreshold {
 		return combinedBoundsInt64(data)
 	}

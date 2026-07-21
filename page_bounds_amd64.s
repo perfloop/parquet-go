@@ -212,6 +212,97 @@ done:
     MOVQ R9, max+32(FP)
     RET
 
+// func combinedBoundsInt64AVX512(data []int64) (min, max int64)
+TEXT ·combinedBoundsInt64AVX512(SB), NOSPLIT, $-40
+    MOVQ data_base+0(FP), AX
+    MOVQ data_len+8(FP), CX
+    XORQ R8, R8
+    XORQ R9, R9
+
+    CMPQ CX, $0
+    JE done
+    XORQ SI, SI
+    MOVQ (AX), R8 // min
+    MOVQ (AX), R9 // max
+
+    CMPQ CX, $32
+    JB loop
+
+    MOVQ CX, DI
+    SHRQ $5, DI
+    SHLQ $5, DI
+    VPBROADCASTQ (AX), Z0
+    VMOVDQU64 Z0, Z1
+    VMOVDQU64 Z0, Z2
+    VMOVDQU64 Z0, Z3
+    VMOVDQU64 Z0, Z4
+    VMOVDQU64 Z0, Z5
+    VMOVDQU64 Z0, Z6
+    VMOVDQU64 Z0, Z7
+loop32:
+    VMOVDQU64 (AX)(SI*8), Z8
+    VMOVDQU64 64(AX)(SI*8), Z9
+    VMOVDQU64 128(AX)(SI*8), Z10
+    VMOVDQU64 192(AX)(SI*8), Z11
+    VPMINSQ Z8, Z0, Z0
+    VPMINSQ Z9, Z1, Z1
+    VPMINSQ Z10, Z2, Z2
+    VPMINSQ Z11, Z3, Z3
+    VPMAXSQ Z8, Z4, Z4
+    VPMAXSQ Z9, Z5, Z5
+    VPMAXSQ Z10, Z6, Z6
+    VPMAXSQ Z11, Z7, Z7
+    ADDQ $32, SI
+    CMPQ SI, DI
+    JNE loop32
+
+    VPMINSQ Z1, Z0, Z0
+    VPMINSQ Z3, Z2, Z2
+    VPMINSQ Z2, Z0, Z0
+    VPMAXSQ Z5, Z4, Z4
+    VPMAXSQ Z7, Z6, Z6
+    VPMAXSQ Z6, Z4, Z4
+
+    VMOVDQU32 swap32+0(SB), Z1
+    VMOVDQU32 swap32+0(SB), Z2
+    VPERMI2D Z0, Z0, Z1
+    VPERMI2D Z4, Z4, Z2
+    VPMINSQ Y1, Y0, Y0
+    VPMAXSQ Y2, Y4, Y4
+
+    VMOVDQU32 swap32+32(SB), Y1
+    VMOVDQU32 swap32+32(SB), Y2
+    VPERMI2D Y0, Y0, Y1
+    VPERMI2D Y4, Y4, Y2
+    VPMINSQ X1, X0, X0
+    VPMAXSQ X2, X4, X4
+
+    VMOVDQU32 swap32+48(SB), X1
+    VMOVDQU32 swap32+48(SB), X2
+    VPERMI2D X0, X0, X1
+    VPERMI2D X4, X4, X2
+    VPMINSQ X1, X0, X0
+    VPMAXSQ X2, X4, X4
+    VZEROUPPER
+
+    MOVQ X0, R8
+    MOVQ X4, R9
+    CMPQ SI, CX
+    JE done
+loop:
+    MOVQ (AX)(SI*8), DX
+    CMPQ DX, R8
+    CMOVQLT DX, R8
+    CMPQ DX, R9
+    CMOVQGT DX, R9
+    INCQ SI
+    CMPQ SI, CX
+    JNE loop
+done:
+    MOVQ R8, min+24(FP)
+    MOVQ R9, max+32(FP)
+    RET
+
 // func combinedBoundsUint32(data []uint32) (min, max uint32)
 TEXT ·combinedBoundsUint32(SB), NOSPLIT, $-32
     MOVQ data_base+0(FP), AX
