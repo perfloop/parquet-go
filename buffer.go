@@ -476,8 +476,8 @@ var (
 type buffer[T memory.Datum] struct {
 	data           memory.SliceBuffer[T]
 	refc           atomic.Int32
-	pool           *bufferPool[T]
 	clearOnRelease bool
+	pool           *bufferPool[T]
 	stack          []byte
 	id             uint64
 }
