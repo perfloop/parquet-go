@@ -2,30 +2,54 @@
 
 package parquet
 
-import "testing"
+import (
+	"math"
+	"testing"
+
+	"github.com/parquet-go/parquet-go/encoding"
+)
 
 func TestInt64PageBoundsAVX512VectorSlots(t *testing.T) {
 	if !hasAVX512VL {
-		t.Fatal("TestInt64PageBoundsAVX512VectorSlots requires AVX-512VL")
+		t.Skip("requires AVX-512VL")
 	}
 
 	const (
-		// 32,129 has a one-value scalar tail after its 32-wide vector prefix.
-		count       = int64PageBoundsDefaultValueCount + 16
-		vectorStart = 32 // Avoid the first iteration's broadcast seed.
 		vectorWidth = 32
+		vectorStart = 32 // Avoid the first iteration's broadcast seed.
 	)
+	// Round up past the dispatch start to leave a one-value scalar tail after
+	// the 32-wide vector prefix, regardless of the configured page threshold.
+	count := combinedBoundsInt64Threshold + (vectorWidth - combinedBoundsInt64Threshold%vectorWidth) + 1
 
 	t.Run("all-lanes", func(t *testing.T) {
 		for slot := 0; slot < vectorWidth; slot++ {
-			// The rotating max placement makes both extrema visit every lane of the
-			// second 32-value iteration, covering all four ZMM load streams.
+			values := make([]int64, count)
+			state := uint64(count) + 0x9E3779B97F4A7C15
+			for i := range values {
+				state = state*6364136223846793005 + 1442695040888963407
+				values[i] = int64(state >> 1)
+			}
+
+			// Rotate both extrema through a non-initial vector iteration. This
+			// covers every lane of all four ZMM load/accumulator streams.
 			minIndex := vectorStart + slot
 			maxIndex := vectorStart + (slot+1)%vectorWidth
-			values := int64PageBoundsValues(count, minIndex, maxIndex)
-			wantMin, wantMax := int64PageBoundsOracle(values)
-			min, max, ok := newInt64PageBoundsPage(values).Bounds()
+			values[minIndex] = math.MinInt64
+			values[maxIndex] = math.MaxInt64
 
+			wantMin, wantMax := values[0], values[0]
+			for _, value := range values[1:] {
+				if value < wantMin {
+					wantMin = value
+				}
+				if value > wantMax {
+					wantMax = value
+				}
+			}
+
+			page := newInt64Page(Int64Type, 0, int32(len(values)), encoding.Int64Values(values))
+			min, max, ok := page.Bounds()
 			if !ok {
 				t.Errorf("slot %d: Bounds() returned ok=false", slot)
 				continue
