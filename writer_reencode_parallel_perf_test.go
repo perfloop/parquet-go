@@ -32,8 +32,9 @@ func (r reencodeBenchmarkReaderAt) ReadAt(p []byte, off int64) (int, error) {
 }
 
 // reencodeTraceReaderAt records concurrent ReadAt calls while retaining the
-// ReaderAt contract. The small delay makes independent page-reader overlap
-// observable without changing the writer's source or output semantics.
+// ReaderAt contract. Its delay is only a controlled scheduling aid for the
+// overlap observation; the paired zero-delay control below guards the ordinary
+// in-memory ReaderAt path and compares its serialized output.
 type reencodeTraceReaderAt struct {
 	reencodeBenchmarkReaderAt
 	delay time.Duration
@@ -99,7 +100,7 @@ func supportsReencodeBenchmarkColumnConcurrency() bool {
 	return field.IsValid() && field.CanSet() && field.Kind() == reflect.Int
 }
 
-func newReencodeTraceSource(t testing.TB) ([]copyTestRow, *File, *reencodeTraceReaderAt) {
+func newReencodeTraceSource(t testing.TB, delay time.Duration) ([]copyTestRow, *File, *reencodeTraceReaderAt) {
 	t.Helper()
 
 	rows := makeCopyTestRows(2_000)
@@ -114,7 +115,7 @@ func newReencodeTraceSource(t testing.TB) ([]copyTestRow, *File, *reencodeTraceR
 
 	reader := &reencodeTraceReaderAt{
 		reencodeBenchmarkReaderAt: reencodeBenchmarkReaderAt{data: bytes.Clone(source.Bytes())},
-		delay:                     time.Millisecond,
+		delay:                     delay,
 	}
 	file, err := OpenFile(reader, int64(len(reader.data)))
 	if err != nil {
@@ -164,10 +165,10 @@ func rewriteReencodeTrace(t *testing.T, file *File, rows []copyTestRow, options 
 // opt-in field is present, the same fixture also proves a bounded parallel wave
 // preserves the exact serialized output.
 func TestWriteRowGroupReencodeSerialTrace(t *testing.T) {
-	rows, file, reader := newReencodeTraceSource(t)
+	rows, delayedFile, delayedReader := newReencodeTraceSource(t, time.Millisecond)
 
-	serial := rewriteReencodeTrace(t, file, rows)
-	maxActive, calls := reader.trace()
+	serial := rewriteReencodeTrace(t, delayedFile, rows)
+	maxActive, calls := delayedReader.trace()
 	if calls == 0 {
 		t.Fatal("L3 trace observed no source ReaderAt calls")
 	}
@@ -176,16 +177,36 @@ func TestWriteRowGroupReencodeSerialTrace(t *testing.T) {
 	}
 	t.Logf("reencode source-read trace: degree=1 max-active=%d calls=%d", maxActive, calls)
 
+	// This zero-delay control is the deployment-shaped in-memory ReaderAt path.
+	// It must have the same serial source-read geometry and serialized result as
+	// the delayed trace, so the delay cannot create a semantic result by itself.
+	controlRows, controlFile, controlReader := newReencodeTraceSource(t, 0)
+	if !reflect.DeepEqual(controlRows, rows) {
+		t.Fatal("zero-delay control source rows differ from delayed source rows")
+	}
+	control := rewriteReencodeTrace(t, controlFile, controlRows)
+	if !bytes.Equal(control, serial) {
+		t.Fatal("zero-delay ReaderAt output differs from delayed trace output")
+	}
+	maxActive, calls = controlReader.trace()
+	if calls == 0 {
+		t.Fatal("zero-delay control observed no source ReaderAt calls")
+	}
+	if maxActive != 1 {
+		t.Fatalf("zero-delay serial L3 trace had max %d simultaneous source reads, want 1", maxActive)
+	}
+	t.Logf("reencode source-read control: delay=0 max-active=%d output=byte-identical", maxActive)
+
 	if !supportsReencodeBenchmarkColumnConcurrency() {
 		return
 	}
 
-	reader.resetTrace()
-	parallel := rewriteReencodeTrace(t, file, rows, reencodeBenchmarkColumnConcurrency(3))
+	delayedReader.resetTrace()
+	parallel := rewriteReencodeTrace(t, delayedFile, rows, reencodeBenchmarkColumnConcurrency(3))
 	if !bytes.Equal(parallel, serial) {
 		t.Fatal("parallel L3 output differs byte-for-byte from degree-one output")
 	}
-	maxActive, calls = reader.trace()
+	maxActive, calls = delayedReader.trace()
 	if calls == 0 {
 		t.Fatal("parallel L3 trace observed no source ReaderAt calls")
 	}
