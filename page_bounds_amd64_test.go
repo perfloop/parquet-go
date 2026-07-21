@@ -11,7 +11,7 @@ import (
 
 func TestInt64PageBoundsAVX512VectorSlots(t *testing.T) {
 	if !hasAVX512VL {
-		t.Skip("requires AVX-512VL")
+		t.Skipf("requires AVX-512VL (hasAVX512VL=%t)", hasAVX512VL)
 	}
 
 	const (
