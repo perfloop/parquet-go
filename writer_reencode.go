@@ -143,11 +143,12 @@ func (w *Writer) packSegmentsByColumn(segments []RowGroup, schema *Schema, sorti
 		return 0, err
 	}
 	dst := w.writer.currentRowGroup.columns
+	values := make([]Value, reencodeValueBufferSize)
 	w.configureBloomFiltersForSegments(segments)
 	for _, seg := range segments {
 		columns := seg.ColumnChunks()
 		for i := range columns {
-			if err := copyColumnValues(dst[i], columns[i]); err != nil {
+			if err := copyColumnValues(dst[i], columns[i], values); err != nil {
 				return 0, err
 			}
 		}
@@ -175,8 +176,9 @@ func (w *Writer) configureBloomFiltersForSegments(segments []RowGroup) {
 // column writer, reading values column-wise instead of materializing rows.
 func (w *Writer) writeRowGroupByColumn(columns []ColumnChunk) error {
 	dst := w.writer.currentRowGroup.columns
+	values := make([]Value, reencodeValueBufferSize)
 	for i, col := range columns {
-		if err := copyColumnValues(dst[i], col); err != nil {
+		if err := copyColumnValues(dst[i], col, values); err != nil {
 			return err
 		}
 	}
@@ -189,16 +191,16 @@ func (w *Writer) writeRowGroupByColumn(columns []ColumnChunk) error {
 const reencodeValueBufferSize = 1024
 
 // copyColumnValues reads every value of src in order and writes it to dst,
-// without materializing rows.
-func copyColumnValues(dst *ColumnWriter, src ColumnChunk) error {
+// without materializing rows. values is caller-owned and is reused after this
+// synchronous call returns.
+func copyColumnValues(dst *ColumnWriter, src ColumnChunk, values []Value) error {
 	reader := NewColumnChunkValueReader(src)
 	defer reader.Close()
 
-	buf := make([]Value, reencodeValueBufferSize)
 	for {
-		n, err := reader.ReadValues(buf)
+		n, err := reader.ReadValues(values)
 		if n > 0 {
-			if _, werr := dst.WriteRowValues(buf[:n]); werr != nil {
+			if _, werr := dst.WriteRowValues(values[:n]); werr != nil {
 				return werr
 			}
 		}
