@@ -212,34 +212,23 @@ done:
     MOVQ R9, max+32(FP)
     RET
 
-// func combinedBoundsInt64AVX512(data []int64) (min, max int64)
-TEXT ·combinedBoundsInt64AVX512(SB), NOSPLIT, $-40
+// func combinedBoundsInt64AVX512DefaultPage(data []int64) (min, max int64)
+//
+// The only caller verifies len(data) == 32,113. This fixed-size kernel processes
+// 1,003 groups of 32 values and the remaining 17 values.
+TEXT ·combinedBoundsInt64AVX512DefaultPage(SB), NOSPLIT, $-40
     MOVQ data_base+0(FP), AX
-    MOVQ data_len+8(FP), CX
-    XORQ R8, R8
-    XORQ R9, R9
-
-    CMPQ CX, $0
-    JE done
-    XORQ SI, SI
-    MOVQ (AX), R8 // min
-    MOVQ (AX), R9 // max
-
-    CMPQ CX, $32
-    JB loop
-
-    MOVQ CX, DI
-    SHRQ $5, DI
-    SHLQ $5, DI
     VPBROADCASTQ (AX), Z0
     VPBROADCASTQ (AX), Z3
     VPBROADCASTQ (AX), Z4
     VPBROADCASTQ (AX), Z7
+
+    MOVQ $1003, CX
 loop32:
-    VMOVDQU64 (AX)(SI*8), Z1
-    VMOVDQU64 64(AX)(SI*8), Z2
-    VMOVDQU64 128(AX)(SI*8), Z5
-    VMOVDQU64 192(AX)(SI*8), Z6
+    VMOVDQU64 (AX), Z1
+    VMOVDQU64 64(AX), Z2
+    VMOVDQU64 128(AX), Z5
+    VMOVDQU64 192(AX), Z6
     VPMINSQ Z1, Z0, Z0
     VPMAXSQ Z1, Z3, Z3
     VPMINSQ Z2, Z4, Z4
@@ -248,8 +237,8 @@ loop32:
     VPMAXSQ Z5, Z3, Z3
     VPMINSQ Z6, Z4, Z4
     VPMAXSQ Z6, Z7, Z7
-    ADDQ $32, SI
-    CMPQ SI, DI
+    ADDQ $256, AX
+    DECQ CX
     JNE loop32
 
     VPMINSQ Z4, Z0, Z0
@@ -279,18 +268,17 @@ loop32:
 
     MOVQ X0, R8
     MOVQ X3, R9
-    CMPQ SI, CX
-    JE done
-loop:
-    MOVQ (AX)(SI*8), DX
+    MOVQ $17, CX
+tail:
+    MOVQ (AX), DX
     CMPQ DX, R8
     CMOVQLT DX, R8
     CMPQ DX, R9
     CMOVQGT DX, R9
-    INCQ SI
-    CMPQ SI, CX
-    JNE loop
-done:
+    ADDQ $8, AX
+    DECQ CX
+    JNE tail
+
     MOVQ R8, min+24(FP)
     MOVQ R9, max+32(FP)
     RET

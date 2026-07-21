@@ -42,7 +42,7 @@ const (
 	combinedBoundsThreshold = 1 * 1024 * 1024
 
 	// A default 256 KiB page flushes after this many INT64 values.
-	combinedBoundsInt64Threshold = 32_113
+	combinedBoundsInt64DefaultPageValueCount = 32_113
 )
 
 //go:noescape
@@ -55,7 +55,7 @@ func combinedBoundsInt32(data []int32) (min, max int32)
 func combinedBoundsInt64(data []int64) (min, max int64)
 
 //go:noescape
-func combinedBoundsInt64AVX512(data []int64) (min, max int64)
+func combinedBoundsInt64AVX512DefaultPage(data []int64) (min, max int64)
 
 //go:noescape
 func combinedBoundsUint32(data []uint32) (min, max uint32)
@@ -82,10 +82,8 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	if hasAVX512VL &&
-		len(data) >= combinedBoundsInt64Threshold &&
-		8*len(data) < combinedBoundsThreshold {
-		return combinedBoundsInt64AVX512(data)
+	if hasAVX512VL && len(data) == combinedBoundsInt64DefaultPageValueCount {
+		return combinedBoundsInt64AVX512DefaultPage(data)
 	}
 	if 8*len(data) >= combinedBoundsThreshold {
 		return combinedBoundsInt64(data)
