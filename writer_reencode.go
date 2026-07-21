@@ -31,6 +31,16 @@ var reencodePathCounter atomic.Int64
 // baseline.
 var disableWriteReencode bool
 
+// reencodeColumnCopyTrace is nil in normal operation. The proof harness uses it
+// to observe actual copyColumnValues spans without changing the source reader or
+// introducing an artificial I/O delay.
+type reencodeColumnCopyTrace struct {
+	begin func(column int)
+	end   func(column int)
+}
+
+var reencodeColumnCopyTraceHook atomic.Pointer[reencodeColumnCopyTrace]
+
 // columnOrientedRowGroup reports whether every column of rowGroup can be read
 // column-wise while preserving row order, and the row count fits the configured
 // row group size. This holds for file-backed chunks (a single row group of a
@@ -176,7 +186,15 @@ func (w *Writer) configureBloomFiltersForSegments(segments []RowGroup) {
 func (w *Writer) writeRowGroupByColumn(columns []ColumnChunk) error {
 	dst := w.writer.currentRowGroup.columns
 	for i, col := range columns {
-		if err := copyColumnValues(dst[i], col); err != nil {
+		trace := reencodeColumnCopyTraceHook.Load()
+		if trace != nil {
+			trace.begin(i)
+		}
+		err := copyColumnValues(dst[i], col)
+		if trace != nil {
+			trace.end(i)
+		}
+		if err != nil {
 			return err
 		}
 	}
