@@ -71,7 +71,7 @@ func (v *Values) Kind() Kind {
 	return v.kind
 }
 
-func (v *Values) Data() (data []byte, offsets []uint32) {
+func (v Values) Data() (data []byte, offsets []uint32) {
 	return v.data, v.offsets
 }
 
