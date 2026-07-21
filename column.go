@@ -944,6 +944,8 @@ func decodeLevels(enc encoding.Encoding, numValues int, data []byte, clearOnRele
 		switch {
 		case levels.data.Len() < numValues:
 			err = fmt.Errorf("decoding level expected %d values but got only %d", numValues, levels.data.Len())
+			levels.unref()
+			levels = nil
 		case levels.data.Len() > numValues:
 			levels.data.Resize(numValues)
 		}

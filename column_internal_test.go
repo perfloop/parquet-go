@@ -557,18 +557,37 @@ func TestDecodeLevelsClearsBufferOnError(t *testing.T) {
 	previousProcs := runtime.GOMAXPROCS(1)
 	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
 
-	// Clear prior pool state, then decode one complete RLE run followed by a
-	// truncated header. The decoder writes the first level before failing.
-	runtime.GC()
-	runtime.GC()
-	_, err := decodeLevels(&rle.Encoding{BitWidth: 1}, 64, []byte{2, 1, 0x80}, true)
-	if err == nil {
-		t.Fatal("decoding truncated levels succeeded")
-	}
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{
+			name: "truncated header after a complete run",
+			data: []byte{2, 1, 0x80},
+		},
+		{
+			name: "complete run shorter than the declared value count",
+			data: []byte{2, 1},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// Clear prior pool state, then decode one complete RLE run that writes
+			// a level before the decoder or value-count validation rejects it.
+			runtime.GC()
+			runtime.GC()
+			levels, err := decodeLevels(&rle.Encoding{BitWidth: 1}, 64, test.data, true)
+			if err == nil {
+				t.Fatal("decoding malformed levels succeeded")
+			}
+			if levels != nil {
+				t.Fatal("decoding malformed levels retained its buffer")
+			}
 
-	reused := buffers.get(64)
-	defer reused.unref()
-	if got := reused.data.Slice()[0]; got != 0 {
-		t.Fatalf("reused level buffer retained decoded value %d after error", got)
+			reused := buffers.get(64)
+			defer reused.unref()
+			if got := reused.data.Slice()[0]; got != 0 {
+				t.Fatalf("reused level buffer retained decoded value %d after error", got)
+			}
+		})
 	}
 }

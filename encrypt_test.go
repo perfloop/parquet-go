@@ -999,9 +999,14 @@ func TestEncryptedPageReuseDoesNotExposePriorOffsets(t *testing.T) {
 	if len(victimOffsets) != len(victimValues)+1 {
 		t.Fatalf("victim page has %d offsets, want %d", len(victimOffsets), len(victimValues)+1)
 	}
-	privateOffset := victimOffsets[len(victimOffsets)-1]
-	if privateOffset == uint32(len(attackerValue)) {
-		t.Fatal("victim offset was not distinct from attacker data")
+	privateOffsets := make(map[uint32]struct{}, len(victimOffsets)-1)
+	for _, offset := range victimOffsets[1:] {
+		if offset != 0 {
+			privateOffsets[offset] = struct{}{}
+		}
+	}
+	if len(privateOffsets) == 0 {
+		t.Fatal("victim page did not have nonzero offsets")
 	}
 	parquet.Release(victim)
 	if err := victimPages.Close(); err != nil {
@@ -1023,8 +1028,11 @@ func TestEncryptedPageReuseDoesNotExposePriorOffsets(t *testing.T) {
 		if len(attackerOffsets) != 2 {
 			t.Fatalf("attacker page has %d offsets, want 2", len(attackerOffsets))
 		}
+		if cap(attackerOffsets) <= len(attackerOffsets) {
+			t.Fatal("attacker offsets did not expose spare capacity")
+		}
 		for _, offset := range attackerOffsets[len(attackerOffsets):cap(attackerOffsets)] {
-			if offset == privateOffset {
+			if _, ok := privateOffsets[offset]; ok {
 				t.Fatal("attacker page exposed offsets from separately keyed victim file")
 			}
 		}
