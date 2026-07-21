@@ -709,8 +709,9 @@ func schemaRepetitionTypeOf(s *format.SchemaElement) format.FieldRepetitionType 
 	return format.Required
 }
 
-func (c *Column) decompress(compressedPageData []byte, uncompressedPageSize int32) (page *buffer[byte], err error) {
+func (c *Column) decompress(compressedPage *buffer[byte], compressedPageData []byte, uncompressedPageSize int32) (page *buffer[byte], err error) {
 	page = buffers.get(int(uncompressedPageSize))
+	page.clearOnRelease = compressedPage.clearOnRelease
 	decoded, err := c.compression.Decode(page.data.Slice(), compressedPageData)
 	switch {
 	case err != nil:
@@ -737,7 +738,7 @@ func (c *Column) decodeDataPageV1(header DataPageHeaderV1, page *buffer[byte], d
 	)
 
 	if isCompressed(c.compression) {
-		if page, err = c.decompress(pageData, size); err != nil {
+		if page, err = c.decompress(page, pageData, size); err != nil {
 			return nil, fmt.Errorf("decompressing data page v1: %w", err)
 		}
 		defer page.unref()
@@ -756,6 +757,7 @@ func (c *Column) decodeDataPageV1(header DataPageHeaderV1, page *buffer[byte], d
 		if err != nil {
 			return nil, fmt.Errorf("decoding repetition levels of data page v1: %w", err)
 		}
+		repetitionLevels.clearOnRelease = page.clearOnRelease
 		defer repetitionLevels.unref()
 	}
 
@@ -765,6 +767,7 @@ func (c *Column) decodeDataPageV1(header DataPageHeaderV1, page *buffer[byte], d
 		if err != nil {
 			return nil, fmt.Errorf("decoding definition levels of data page v1: %w", err)
 		}
+		definitionLevels.clearOnRelease = page.clearOnRelease
 		defer definitionLevels.unref()
 
 		// Data pages v1 did not embed the number of null values,
@@ -805,6 +808,7 @@ func (c *Column) decodeDataPageV2(header DataPageHeaderV2, page *buffer[byte], d
 			return nil, fmt.Errorf("decoding repetition levels of data page v2: %w", io.ErrUnexpectedEOF)
 		}
 		if repetitionLevels != nil {
+			repetitionLevels.clearOnRelease = page.clearOnRelease
 			defer repetitionLevels.unref()
 
 			repLevels := repetitionLevels.data.Slice()
@@ -826,12 +830,13 @@ func (c *Column) decodeDataPageV2(header DataPageHeaderV2, page *buffer[byte], d
 			return nil, fmt.Errorf("decoding definition levels of data page v2: %w", io.ErrUnexpectedEOF)
 		}
 		if definitionLevels != nil {
+			definitionLevels.clearOnRelease = page.clearOnRelease
 			defer definitionLevels.unref()
 		}
 	}
 
 	if isCompressed(c.compression) && header.IsCompressed() {
-		if page, err = c.decompress(pageData, size); err != nil {
+		if page, err = c.decompress(page, pageData, size); err != nil {
 			return nil, fmt.Errorf("decompressing data page v2: %w", err)
 		}
 		defer page.unref()
@@ -866,6 +871,7 @@ func (c *Column) decodeDataPage(header DataPageHeader, numValues int, repetition
 		pageValues = data
 	default:
 		vbuf = buffers.get(pageType.EstimateDecodeSize(numValues, data, pageEncoding))
+		vbuf.clearOnRelease = page.clearOnRelease
 		defer vbuf.unref()
 		pageValues = vbuf.data.Slice()
 	}
@@ -965,7 +971,7 @@ func (c *Column) decodeDictionary(header DictionaryPageHeader, page *buffer[byte
 
 	if isCompressed(c.compression) {
 		var err error
-		if page, err = c.decompress(pageData, size); err != nil {
+		if page, err = c.decompress(page, pageData, size); err != nil {
 			return nil, fmt.Errorf("decompressing dictionary page: %w", err)
 		}
 		defer page.unref()

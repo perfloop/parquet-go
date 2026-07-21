@@ -474,11 +474,12 @@ var (
 )
 
 type buffer[T memory.Datum] struct {
-	data  memory.SliceBuffer[T]
-	refc  atomic.Int32
-	pool  *bufferPool[T]
-	stack []byte
-	id    uint64
+	data           memory.SliceBuffer[T]
+	refc           atomic.Int32
+	pool           *bufferPool[T]
+	clearOnRelease bool
+	stack          []byte
+	id             uint64
 }
 
 func newBuffer[T memory.Datum](data []T) *buffer[T] {
@@ -502,6 +503,10 @@ func (b *buffer[T]) unref() {
 	case refc < 0:
 		panic("BUG: buffer reference count underflow")
 	case refc == 0:
+		if b.clearOnRelease {
+			clear(b.data.Slice()[:b.data.Cap()])
+			b.clearOnRelease = false
+		}
 		b.data.Reset()
 		if b.pool != nil {
 			b.pool.put(b)

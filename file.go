@@ -1348,8 +1348,8 @@ func (f *FilePages) readDictionary() error {
 			return err
 		}
 		page = buffers.get(len(bodyPlain))
+		page.clearOnRelease = true
 		copy(page.data.Slice(), bodyPlain)
-		page.ref()
 	} else {
 		decoder := thrift.NewDecoder(f.protocol.NewReader(rbuf))
 		if err := decoder.Decode(header); err != nil {
@@ -1535,6 +1535,8 @@ func (f *FilePages) readEncryptedPage() (*format.PageHeader, *buffer[byte], erro
 	}
 
 	page := buffers.get(len(bodyPlain))
+	// Page.Data can expose spare capacity, so scrub decrypted plaintext before reuse.
+	page.clearOnRelease = true
 	copy(page.data.Slice(), bodyPlain)
 
 	if isDictPage {
