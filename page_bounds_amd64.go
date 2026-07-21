@@ -82,11 +82,13 @@ func boundsInt32(data []int32) (min, max int32) {
 }
 
 func boundsInt64(data []int64) (min, max int64) {
-	if hasAVX512VL && len(data) >= combinedBoundsInt64Threshold && 8*len(data) < combinedBoundsThreshold {
-		return combinedBoundsInt64AVX512(data)
-	}
-	if 8*len(data) >= combinedBoundsThreshold {
-		return combinedBoundsInt64(data)
+	if len(data) >= combinedBoundsInt64Threshold {
+		if hasAVX512VL && 8*len(data) < combinedBoundsThreshold {
+			return combinedBoundsInt64AVX512(data)
+		}
+		if 8*len(data) >= combinedBoundsThreshold {
+			return combinedBoundsInt64(data)
+		}
 	}
 	min = minInt64(data)
 	max = maxInt64(data)

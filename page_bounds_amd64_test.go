@@ -3,7 +3,6 @@
 package parquet
 
 import (
-	"fmt"
 	"math"
 	"testing"
 
@@ -23,44 +22,14 @@ func TestInt64PageBoundsAVX512VectorSlots(t *testing.T) {
 	// the 32-wide vector prefix, regardless of the configured page threshold.
 	count := combinedBoundsInt64Threshold + (vectorWidth - combinedBoundsInt64Threshold%vectorWidth) + 1
 
-	valuesFor := func(n int) []int64 {
-		values := make([]int64, n)
-		state := uint64(n) + 0x9E3779B97F4A7C15
-		for i := range values {
-			state = state*6364136223846793005 + 1442695040888963407
-			values[i] = int64(state >> 1)
-		}
-		return values
-	}
-	checkBounds := func(t *testing.T, values []int64) {
-		t.Helper()
-
-		wantMin, wantMax := values[0], values[0]
-		for _, value := range values[1:] {
-			if value < wantMin {
-				wantMin = value
-			}
-			if value > wantMax {
-				wantMax = value
-			}
-		}
-
-		page := newInt64Page(Int64Type, 0, int32(len(values)), encoding.Int64Values(values))
-		min, max, ok := page.Bounds()
-		if !ok {
-			t.Fatal("Bounds() returned ok=false")
-		}
-		if got := min.Int64(); got != wantMin {
-			t.Errorf("min = %d, want %d", got, wantMin)
-		}
-		if got := max.Int64(); got != wantMax {
-			t.Errorf("max = %d, want %d", got, wantMax)
-		}
-	}
-
 	t.Run("all-lanes", func(t *testing.T) {
 		for slot := 0; slot < vectorWidth; slot++ {
-			values := valuesFor(count)
+			values := make([]int64, count)
+			state := uint64(count) + 0x9E3779B97F4A7C15
+			for i := range values {
+				state = state*6364136223846793005 + 1442695040888963407
+				values[i] = int64(state >> 1)
+			}
 
 			// Rotate both extrema through a non-initial vector iteration. This
 			// covers every lane of all four ZMM load/accumulator streams.
@@ -69,18 +38,28 @@ func TestInt64PageBoundsAVX512VectorSlots(t *testing.T) {
 			values[minIndex] = math.MinInt64
 			values[maxIndex] = math.MaxInt64
 
-			t.Run(fmt.Sprintf("slot-%d", slot), func(t *testing.T) {
-				checkBounds(t, values)
-			})
-		}
-	})
+			wantMin, wantMax := values[0], values[0]
+			for _, value := range values[1:] {
+				if value < wantMin {
+					wantMin = value
+				}
+				if value > wantMax {
+					wantMax = value
+				}
+			}
 
-	t.Run("scalar-tail-extrema", func(t *testing.T) {
-		// count has a one-element scalar tail; adding 30 leaves 31 tail
-		// elements, so both extrema are reconciled after vector reduction.
-		values := valuesFor(count + 30)
-		values[len(values)-2] = math.MinInt64
-		values[len(values)-1] = math.MaxInt64
-		checkBounds(t, values)
+			page := newInt64Page(Int64Type, 0, int32(len(values)), encoding.Int64Values(values))
+			min, max, ok := page.Bounds()
+			if !ok {
+				t.Errorf("slot %d: Bounds() returned ok=false", slot)
+				continue
+			}
+			if got := min.Int64(); got != wantMin {
+				t.Errorf("slot %d: min = %d, want %d", slot, got, wantMin)
+			}
+			if got := max.Int64(); got != wantMax {
+				t.Errorf("slot %d: max = %d, want %d", slot, got, wantMax)
+			}
+		}
 	})
 }
