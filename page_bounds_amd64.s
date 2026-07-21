@@ -219,8 +219,7 @@ TEXT ·combinedBoundsInt64AVX512(SB), NOSPLIT, $-40
     XORQ SI, SI
 
     MOVQ CX, DI
-    SHRQ $4, DI
-    SHLQ $4, DI
+    ANDQ $-16, DI
     VPBROADCASTQ (AX), Z0
     VPBROADCASTQ (AX), Z1
     VPBROADCASTQ (AX), Z2
