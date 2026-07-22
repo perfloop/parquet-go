@@ -310,7 +310,7 @@ func copyRows(dst RowWriter, src RowReader, buf []Row) (written int64, err error
 	targetSchema := targetSchemaOf(dst)
 	sourceSchema := sourceSchemaOf(src)
 
-	if targetSchema != nil && sourceSchema != nil {
+	if targetSchema != nil && sourceSchema != nil && targetSchema != sourceSchema {
 		if !EqualNodes(targetSchema, sourceSchema) {
 			conv, err := Convert(targetSchema, sourceSchema)
 			if err != nil {
