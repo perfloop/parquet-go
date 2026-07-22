@@ -38,10 +38,10 @@ func newPlainByteArrayVariantFixture(tb testing.TB, numRows, payloadSize, pageBu
 	for i := range rows {
 		payload := make([]byte, payloadSize)
 		for j := range payload {
-			payload[j] = byte((i*31 + j*17 + payloadSize) % 251)
+			payload[j] = byte('a' + (i*31+j*17+payloadSize)%26)
 		}
-		payload[0] = byte(i%251 + 1)
-		payload[len(payload)-1] = byte((i*7+13)%251 + 1)
+		payload[0] = byte('a' + i%26)
+		payload[len(payload)-1] = byte('a' + (i*7+13)%26)
 		payloads[i] = payload
 		checksum = plainByteArrayChecksum(checksum, payload)
 		rows[i] = shreddedVariantRow{
