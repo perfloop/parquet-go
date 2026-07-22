@@ -1,6 +1,8 @@
 package parquet
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"testing"
@@ -109,21 +111,91 @@ func TestCopyRowsSchemaComparison(t *testing.T) {
 		want := []Row{{Int64Value(42).Level(0, 0, 0)}}
 		assertCopyRowsEqual(t, dst.rows, want)
 	})
+
+	t.Run("row buffer to writer shares its cached schema", func(t *testing.T) {
+		input := makeWideRows(1)
+		buffer := NewRowBuffer[wideRow]()
+		if _, err := buffer.Write(input); err != nil {
+			t.Fatal(err)
+		}
+
+		var output bytes.Buffer
+		writer := NewGenericWriter[wideRow](&output)
+		if buffer.Schema() != writer.Schema() {
+			t.Fatal("row buffer and writer did not share their cached schema")
+		}
+
+		reader := buffer.Rows()
+		n, err := CopyRows(writer, reader)
+		closeErr := reader.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if n != int64(len(input)) {
+			t.Fatalf("copied %d rows, want %d", n, len(input))
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		decoded := make([]wideRow, len(input))
+		decodedReader := NewGenericReader[wideRow](bytes.NewReader(output.Bytes()))
+		read, err := decodedReader.Read(decoded)
+		closeErr = decodedReader.Close()
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatal(err)
+		}
+		if closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		if read != len(input) {
+			t.Fatalf("read %d rows, want %d", read, len(input))
+		}
+		for i := range input {
+			if decoded[i] != input[i] {
+				t.Fatalf("row %d = %#v, want %#v", i, decoded[i], input[i])
+			}
+		}
+	})
 }
 
-func BenchmarkCopyRowsWideSameSchema(b *testing.B) {
-	schema := copyRowsWideSchema(128, Int64Type)
-	src := &copyRowsSchemaReader{schema: schema}
-	dst := &copyRowsSchemaWriter{schema: schema}
+func BenchmarkCopyRowsRowBufferToWriter(b *testing.B) {
+	input := makeWideRows(1)
+	buffer := NewRowBuffer[wideRow]()
+	if _, err := buffer.Write(input); err != nil {
+		b.Fatal(err)
+	}
+	writer := NewGenericWriter[wideRow](io.Discard)
+	if buffer.Schema() != writer.Schema() {
+		b.Fatal("row buffer and writer did not share their cached schema")
+	}
+	b.Cleanup(func() {
+		if err := writer.Close(); err != nil {
+			b.Error(err)
+		}
+	})
 
 	for b.Loop() {
-		n, err := CopyRows(dst, src)
+		b.StopTimer()
+		writer.Reset(io.Discard)
+		reader := buffer.Rows()
+		b.StartTimer()
+		n, err := CopyRows(writer, reader)
+		b.StopTimer()
+		closeErr := reader.Close()
 		if err != nil {
 			b.Fatal(err)
 		}
-		if n != 0 {
-			b.Fatalf("copied %d rows, want 0", n)
+		if closeErr != nil {
+			b.Fatal(closeErr)
 		}
+		if n != int64(len(input)) {
+			b.Fatalf("copied %d rows, want %d", n, len(input))
+		}
+		b.StartTimer()
 	}
 }
 
