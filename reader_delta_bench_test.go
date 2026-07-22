@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/format"
 )
 
 const genericReaderDeltaInt64ValueCount = 8193
@@ -39,9 +40,29 @@ func newGenericReaderDeltaInt64(t testing.TB) (*parquet.GenericReader[genericRea
 	if err := writer.Close(); err != nil {
 		t.Fatalf("close delta writer: %v", err)
 	}
+	assertGenericReaderDeltaInt64Encoding(t, data.Bytes())
 
 	reader := parquet.NewGenericReader[genericReaderDeltaInt64Row](bytes.NewReader(data.Bytes()))
 	return reader, want, make([]genericReaderDeltaInt64Row, len(want))
+}
+
+func assertGenericReaderDeltaInt64Encoding(t testing.TB, data []byte) {
+	t.Helper()
+
+	file, err := parquet.OpenFile(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("open delta file: %v", err)
+	}
+	metadata := file.Metadata()
+	if len(metadata.RowGroups) != 1 || len(metadata.RowGroups[0].Columns) != 1 {
+		t.Fatalf("unexpected delta file layout: %d row groups", len(metadata.RowGroups))
+	}
+	for _, encoding := range metadata.RowGroups[0].Columns[0].MetaData.Encoding {
+		if encoding == format.DeltaBinaryPacked {
+			return
+		}
+	}
+	t.Fatal("delta benchmark file does not advertise DELTA_BINARY_PACKED")
 }
 
 func readGenericReaderDeltaInt64(t testing.TB, reader *parquet.GenericReader[genericReaderDeltaInt64Row], got, want []genericReaderDeltaInt64Row) {
