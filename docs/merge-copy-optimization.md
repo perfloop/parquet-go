@@ -321,13 +321,14 @@ Guards that keep the change scoped and correct:
 - Splitting only happens when at least one segment is copy-eligible, so pure
   re-encode merges keep their existing output structure.
 
-### Increment 4 — L2/L3 partial layers (L3 DONE, L2 DESIGNED)
+### Increment 4 — L2/L3 partial layers (DONE)
 
 The config-mismatch case already produces correct output via the row-oriented
-re-encode fallback; L2/L3 only make it faster. **L3 is implemented** (see below).
-L2 is designed but not implemented; it is worth doing for codec-migration
-workloads (e.g. recompress an existing Snappy file to Zstd) because it skips
-value decode and re-encode, paying only decompress + recompress.
+re-encode fallback; L2/L3 only make it faster. **L2 is implemented** for
+file-backed codec-migration workloads (for example, recompressing an existing
+Snappy file to Zstd): it skips value decode and re-encode, paying only
+decompress + recompress. **L3** remains the fallback when L2's stricter page
+layout requirements do not hold.
 
 #### L2 — transcode compression, skip value decode
 
@@ -357,33 +358,33 @@ range like L0. It transcodes page-by-page into a staging buffer and rebuilds the
 chunk statistics are codec-independent, so they are copied verbatim from the
 source (as in L0). `TotalCompressedSize` is recomputed.
 
-Building blocks already present: a raw page iterator can be built by reading the
-chunk section `[baseOffset, +TotalCompressedSize)` and decoding each
-`format.PageHeader` followed by `CompressedPageSize` body bytes (the same seam
-`FilePages.readPage` uses before decode); `compress.Codec.Encode/Decode` for the
-transcode; `writerBuffers.crc32` for the CRC; the thrift encoder for the header.
+Implementation: `writer_transcode.go` reads the chunk section
+`[baseOffset, +TotalCompressedSize)`, decodes each `format.PageHeader` followed
+by its `CompressedPageSize` body bytes (the same seam `FilePages.readPage` uses
+before decode), and uses `compress.Codec.Encode/Decode`, `crc32.ChecksumIEEE`,
+and the thrift encoder to rebuild the page. `columnChunkIsTranscodable` is the
+per-chunk L2 predicate; it leaves any ineligible chunk on L3.
 
-Integration: extend the per-chunk predicate to return a tier (L0 / L2 / none).
 L2 stages transcoded data pages in the column's page buffer (reintroducing the
 buffering that L0 avoids — acceptable here since L2 is already CPU-bound on
-(de)compression) plus a transcoded dictionary page, with a prebuilt column index;
-`writeRowGroup` writes them much like the pre-streaming L0 path did.
+(de)compression) plus a transcoded dictionary page and copied column index;
+`writeRowGroup` writes the staged pages and rebuilt offset index.
 
 Risk: page-layout surgery (esp. the V2 levels boundary), CRC, and offset-index
-rebuild — all file-corruption-class if wrong. Mitigation: round-trip tests per
-page version and per codec, plus a property test comparing L2 output bytes'
-decoded values against the source.
+rebuild — all file-corruption-class if wrong. Mitigation: round-trip tests cover
+both data-page versions, dictionary pages, decoded values, and column/offset
+indexes, with a direct L2-versus-L3 comparison for a codec migration.
 
-Expected gain: skips value decode + re-encode but keeps (de)compression, so
-~2–4× over full re-encode for a codec change (vs L0's ~350×, which also skips
-(de)compression).
+Cost model: L2 skips value decode + re-encode but keeps (de)compression; its
+benefit therefore depends on how much of a rewrite's cost is value processing
+rather than compression.
 
 #### L3 — re-encode column-by-column, skip row assembly (DONE)
 
 Implemented in `writer_reencode.go`. When a single file-backed source row group's
-schema matches the writer but it cannot be copied verbatim (codec/encoding/etc.
-differ), `WriteRowGroup` re-encodes it **column-by-column** instead of the
-row-oriented fallback: it reads each column's values directly
+schema matches the writer but neither L0 nor L2 can apply, `WriteRowGroup`
+re-encodes it **column-by-column** instead of the row-oriented fallback: it reads
+each column's values directly
 (`ColumnChunkValueReader`) and feeds them to the column writer's
 `WriteRowValues`, which re-encodes, re-compresses, computes statistics, and
 populates bloom filters exactly as the row path would. This skips the wasteful

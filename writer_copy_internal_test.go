@@ -494,8 +494,12 @@ func TestWriteRowGroupReencodeMatchesRowPath(t *testing.T) {
 	src := writeCopyTestFile(t, rows, Compression(&Snappy))
 
 	rewrite := func(reencode bool) []byte {
-		defer func(prev bool) { disableWriteReencode = prev }(disableWriteReencode)
+		defer func(reencodeDisabled, transcodeDisabled bool) {
+			disableWriteReencode = reencodeDisabled
+			disableWriteTranscode = transcodeDisabled
+		}(disableWriteReencode, disableWriteTranscode)
 		disableWriteReencode = !reencode
+		disableWriteTranscode = true
 		var dst bytes.Buffer
 		// Codec differs from source (Snappy -> Zstd) so L0 cannot fire.
 		w := NewGenericWriter[copyTestRow](&dst, Compression(&Zstd))
@@ -524,6 +528,46 @@ func TestWriteRowGroupReencodeMatchesRowPath(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotL3, gotRow) {
 		t.Fatal("L3 output differs from row-path output")
+	}
+}
+
+// TestWriteRowGroupTranscodeMatchesReencode verifies that the raw-page path is
+// selected for a codec migration and preserves the L3 path's decoded rows.
+func TestWriteRowGroupTranscodeMatchesReencode(t *testing.T) {
+	rows := makeCopyTestRows(5000)
+	src := writeCopyTestFile(t, rows, Compression(&Snappy), PageBufferSize(512))
+
+	rewrite := func(transcode bool) []byte {
+		defer func(prev bool) { disableWriteTranscode = prev }(disableWriteTranscode)
+		disableWriteTranscode = !transcode
+
+		var dst bytes.Buffer
+		w := NewGenericWriter[copyTestRow](&dst, Compression(&Zstd), PageBufferSize(512))
+		for _, rg := range src.RowGroups() {
+			if _, err := w.WriteRowGroup(rg); err != nil {
+				t.Fatalf("WriteRowGroup(transcode=%v): %v", transcode, err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return dst.Bytes()
+	}
+
+	before := transcodePathCounter.Load()
+	l2 := rewrite(true)
+	if transcoded := transcodePathCounter.Load() - before; transcoded == 0 {
+		t.Fatal("expected the L2 raw-page transcode path to fire")
+	}
+	l3 := rewrite(false)
+
+	gotL2 := readCopyTestRows(t, l2, len(rows))
+	gotL3 := readCopyTestRows(t, l3, len(rows))
+	if !reflect.DeepEqual(gotL2, rows) {
+		t.Fatal("L2 output differs from source data")
+	}
+	if !reflect.DeepEqual(gotL2, gotL3) {
+		t.Fatal("L2 output differs from L3 output")
 	}
 }
 

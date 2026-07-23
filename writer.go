@@ -1529,17 +1529,29 @@ func (w *writer) writeRowGroup(rg *ConcurrentRowGroupWriter, rowGroupSchema *Sch
 			continue
 		}
 
-		rg.columnIndex[i] = c.columnIndex.ColumnIndex()
-		rg.columnIndex[i].RepetitionLevelHistogram = append(rg.columnIndex[i].RepetitionLevelHistogram[:0], c.pageRepetitionLevelHistograms...)
-		rg.columnIndex[i].DefinitionLevelHistogram = append(rg.columnIndex[i].DefinitionLevelHistogram[:0], c.pageDefinitionLevelHistograms...)
+		if c.transcoded != nil {
+			rg.columnIndex[i] = c.transcoded.columnIndex
+			c.columnChunk.MetaData.SizeStatistics = c.transcoded.sizeStats
+		} else {
+			rg.columnIndex[i] = c.columnIndex.ColumnIndex()
+			rg.columnIndex[i].RepetitionLevelHistogram = append(rg.columnIndex[i].RepetitionLevelHistogram[:0], c.pageRepetitionLevelHistograms...)
+			rg.columnIndex[i].DefinitionLevelHistogram = append(rg.columnIndex[i].DefinitionLevelHistogram[:0], c.pageDefinitionLevelHistograms...)
 
-		c.columnChunk.MetaData.SizeStatistics = format.SizeStatistics{
-			UnencodedByteArrayDataBytes: c.totalUnencodedByteArrayBytes,
-			RepetitionLevelHistogram:    slices.Clone(c.repetitionLevelHistogram),
-			DefinitionLevelHistogram:    slices.Clone(c.definitionLevelHistogram),
+			c.columnChunk.MetaData.SizeStatistics = format.SizeStatistics{
+				UnencodedByteArrayDataBytes: c.totalUnencodedByteArrayBytes,
+				RepetitionLevelHistogram:    slices.Clone(c.repetitionLevelHistogram),
+				DefinitionLevelHistogram:    slices.Clone(c.definitionLevelHistogram),
+			}
 		}
 
-		if c.dictionary != nil {
+		if c.transcoded != nil {
+			if len(c.transcoded.dictionary) > 0 {
+				c.columnChunk.MetaData.DictionaryPageOffset = w.writer.offset
+				if _, err := w.writer.Write(c.transcoded.dictionary); err != nil {
+					return 0, fmt.Errorf("writing transcoded dictionary page of row group column %d: %w", i, err)
+				}
+			}
+		} else if c.dictionary != nil {
 			c.columnChunk.MetaData.DictionaryPageOffset = w.writer.offset
 			if err := c.writeDictionaryPage(&w.writer, c.dictionary); err != nil {
 				return 0, fmt.Errorf("writing dictionary page of row group colum %d: %w", i, err)
@@ -1959,9 +1971,10 @@ type ColumnWriter struct {
 	hasSwitchedToPlain bool  // Tracks if dictionary encoding was switched to PLAIN
 	dictionaryMaxBytes int64 // Per-column dictionary size limit
 
-	// Set when this column is being copied verbatim from a source file for the
-	// current row group (see writer_copy.go). nil for the regular re-encode path.
-	copied *copiedChunk
+	// Set when this column is copied from a source file for the current row
+	// group. nil for the regular re-encode path.
+	copied     *copiedChunk
+	transcoded *transcodedChunk
 
 	// Encryption state; nil encKey means column is not encrypted.
 	encKey          []byte
@@ -2003,6 +2016,7 @@ func (c *ColumnWriter) reset() {
 	}
 	c.numPages = 0
 	c.copied = nil
+	c.transcoded = nil
 	// Bloom filters may change in size between row groups, but we retain the
 	// buffer to avoid reallocating large memory blocks.
 	c.filter = c.filter[:0]

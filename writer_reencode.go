@@ -5,10 +5,12 @@ import (
 	"sync/atomic"
 )
 
-// This file implements the "L3" re-encode path for Writer.WriteRowGroup: when a
-// single file-backed source row group's schema matches the writer but it cannot
-// be copied verbatim (the configured codec/encoding/etc. differ), re-encode it
-// column-by-column instead of assembling rows and then deconstructing them.
+// This file implements the column-oriented fallback for Writer.WriteRowGroup:
+// when a single file-backed source row group's schema matches the writer but it
+// cannot be copied verbatim, rewrite it column-by-column instead of assembling
+// rows and then deconstructing them. writer_transcode.go selects L2 raw-page
+// transcoding for eligible codec-only changes; this file retains the L3 value
+// re-encode fallback for every other column.
 //
 // The regular fallback reads the source columns, interleaves their values into
 // Row objects, then immediately tears those rows back apart into columns to
@@ -22,8 +24,8 @@ import (
 // ~1.4–1.8x faster with notably less garbage). See
 // docs/merge-copy-optimization.md.
 
-// reencodePathCounter counts row groups written via the L3 column-oriented
-// re-encode path. Test/benchmark instrumentation only.
+// reencodePathCounter counts row groups written through the column-oriented
+// path. Test/benchmark instrumentation only.
 var reencodePathCounter atomic.Int64
 
 // disableWriteReencode forces WriteRowGroup onto the row-oriented fallback. It
@@ -65,8 +67,8 @@ func (w *Writer) columnOrientedRowGroup(rowGroup RowGroup) ([]ColumnChunk, bool)
 	return columns, true
 }
 
-// reencodableRowGroup reports whether rowGroup can be written via the L3
-// column-oriented re-encode path.
+// reencodableRowGroup reports whether rowGroup can be written through the
+// column-oriented path.
 func (w *Writer) reencodableRowGroup(rowGroup RowGroup) ([]ColumnChunk, bool) {
 	if disableWriteReencode {
 		return nil, false
@@ -171,11 +173,18 @@ func (w *Writer) configureBloomFiltersForSegments(segments []RowGroup) {
 	}
 }
 
-// writeRowGroupByColumn re-encodes each source column chunk into its destination
-// column writer, reading values column-wise instead of materializing rows.
+// writeRowGroupByColumn transcodes file-backed columns whose page format is
+// unchanged apart from compression (L2), then re-encodes the remaining columns
+// from values (L3). Whole-row-group verbatim copies remain on the L0 path above.
 func (w *Writer) writeRowGroupByColumn(columns []ColumnChunk) error {
 	dst := w.writer.currentRowGroup.columns
 	for i, col := range columns {
+		if src, ok := col.(*FileColumnChunk); ok && !disableWriteTranscode && columnChunkIsTranscodable(dst[i], src) {
+			if err := dst[i].loadTranscodedChunk(src); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := copyColumnValues(dst[i], col); err != nil {
 			return err
 		}
