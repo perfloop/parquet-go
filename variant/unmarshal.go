@@ -10,7 +10,7 @@ import (
 // Unmarshal. Unlike Decode, it does not materialize a recursive Value tree.
 func decodeGoValue(m Metadata, data []byte) (any, error) {
 	if len(data) == 0 {
-		return nil, errors.New("variant value: unexpected end of data")
+		return nil, errors.New("variant value: empty data")
 	}
 
 	header := data[0]

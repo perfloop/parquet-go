@@ -1,7 +1,6 @@
 package variant
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"reflect"
@@ -43,9 +42,6 @@ func Unmarshal(metadata, value []byte) (any, error) {
 	m, err := DecodeMetadata(metadata)
 	if err != nil {
 		return nil, fmt.Errorf("variant unmarshal: %w", err)
-	}
-	if len(value) == 0 {
-		return nil, fmt.Errorf("variant unmarshal: %w", errors.New("variant value: empty data"))
 	}
 	v, err := decodeGoValue(m, value)
 	if err != nil {
