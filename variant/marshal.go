@@ -47,7 +47,7 @@ func Unmarshal(metadata, value []byte) (any, error) {
 	if len(value) == 0 {
 		return nil, fmt.Errorf("variant unmarshal: %w", errors.New("variant value: empty data"))
 	}
-	v, _, err := decodeGoValue(m, value)
+	v, err := decodeGoValue(m, value)
 	if err != nil {
 		return nil, fmt.Errorf("variant unmarshal: %w", err)
 	}
