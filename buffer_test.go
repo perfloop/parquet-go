@@ -589,6 +589,46 @@ func TestBuffer(t *testing.T) {
 			}
 		}
 	})
+
+	t.Run("uses replacement byte-array column buffers", func(t *testing.T) {
+		type record struct {
+			First  string
+			Second string
+		}
+
+		want := record{First: "first", Second: "second"}
+		schema := parquet.SchemaOf(record{})
+		buffer := parquet.NewBuffer(schema)
+		columns := buffer.ColumnBuffers()
+		columns[0] = parquet.ByteArrayType.NewColumnBuffer(0, 1)
+
+		row := schema.Deconstruct(nil, want)
+		if n, err := buffer.WriteRows([]parquet.Row{row}); err != nil || n != 1 {
+			t.Fatalf("WriteRows() = %d, %v; want 1, nil", n, err)
+		}
+		if n := buffer.NumRows(); n != 1 {
+			t.Fatalf("NumRows() = %d; want 1", n)
+		}
+
+		reader := buffer.Rows()
+		defer reader.Close()
+		gotRows := make([]parquet.Row, 1)
+		n, err := reader.ReadRows(gotRows)
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatal(err)
+		}
+		if n != len(gotRows) {
+			t.Fatalf("ReadRows() = %d; want %d", n, len(gotRows))
+		}
+
+		var got record
+		if err := schema.Reconstruct(&got, gotRows[0]); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("row = %#v; want %#v", got, want)
+		}
+	})
 }
 
 type sortFunc func(parquet.Type, []parquet.Value)

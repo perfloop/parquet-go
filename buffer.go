@@ -188,15 +188,14 @@ var (
 // writing them to a parquet file. Buffer implements sort.Interface as a way
 // to support reordering the rows that have been written to it.
 type Buffer struct {
-	config           *RowGroupConfig
-	schema           *Schema
-	rowbuf           []Row
-	colbuf           [][]Value
-	chunks           []ColumnChunk
-	columns          []ColumnBuffer
-	byteArrayColumns []*byteArrayColumnBuffer
-	byteArraySizes   []int
-	sorted           []ColumnBuffer
+	config         *RowGroupConfig
+	schema         *Schema
+	rowbuf         []Row
+	colbuf         [][]Value
+	chunks         []ColumnChunk
+	columns        []ColumnBuffer
+	byteArraySizes []int
+	sorted         []ColumnBuffer
 }
 
 // NewBuffer constructs a new buffer, using the given list of buffer options
@@ -287,8 +286,7 @@ func (buf *Buffer) configure(schema *Schema) {
 	buf.rowbuf = make([]Row, 0, 1)
 	buf.colbuf = make([][]Value, len(buf.columns))
 	buf.chunks = make([]ColumnChunk, len(buf.columns))
-	buf.byteArrayColumns = byteArrayColumnsOf(buf.columns)
-	buf.byteArraySizes = make([]int, len(buf.byteArrayColumns))
+	buf.byteArraySizes = make([]int, len(buf.columns))
 
 	for i, column := range buf.columns {
 		buf.chunks[i] = column
@@ -308,7 +306,12 @@ func (buf *Buffer) Size() int64 {
 func (buf *Buffer) NumRows() int64 { return int64(buf.Len()) }
 
 // ColumnChunks returns the buffer columns.
-func (buf *Buffer) ColumnChunks() []ColumnChunk { return buf.chunks }
+func (buf *Buffer) ColumnChunks() []ColumnChunk {
+	for i, column := range buf.columns {
+		buf.chunks[i] = column
+	}
+	return buf.chunks
+}
 
 // ColumnBuffers returns the buffer columns.
 //
@@ -425,32 +428,20 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	return numRows, nil
 }
 
-func byteArrayColumnsOf(columns []ColumnBuffer) []*byteArrayColumnBuffer {
-	if len(columns) == 0 {
-		return nil
-	}
-
-	for _, column := range columns {
-		if _, ok := column.(*byteArrayColumnBuffer); !ok {
-			return nil
-		}
-	}
-
-	byteArrayColumns := make([]*byteArrayColumnBuffer, len(columns))
-	for i, column := range columns {
-		byteArrayColumns[i] = column.(*byteArrayColumnBuffer)
-	}
-	return byteArrayColumns
-}
-
 // writeByteArrayRows writes the canonical prefix of rows directly to the
 // byte-array columns and returns the number of rows written.
 func (buf *Buffer) writeByteArrayRows(rows []Row) int {
-	if len(rows) == 0 || len(buf.byteArrayColumns) == 0 {
+	if len(rows) == 0 || len(buf.columns) == 0 {
 		return 0
 	}
 
-	numColumns := len(buf.byteArrayColumns)
+	for _, column := range buf.columns {
+		if _, ok := column.(*byteArrayColumnBuffer); !ok {
+			return 0
+		}
+	}
+
+	numColumns := len(buf.columns)
 	byteArraySizes := buf.byteArraySizes
 	clear(byteArraySizes)
 
@@ -476,8 +467,8 @@ canonicalRows:
 	if numRows == 0 {
 		return 0
 	}
-	for columnIndex, column := range buf.byteArrayColumns {
-		column.writeRows(rows[:numRows], columnIndex, byteArraySizes[columnIndex])
+	for columnIndex, column := range buf.columns {
+		column.(*byteArrayColumnBuffer).writeRows(rows[:numRows], columnIndex, byteArraySizes[columnIndex])
 	}
 	return numRows
 }
