@@ -305,6 +305,160 @@ func TestWriteRowsColumns(t *testing.T) {
 	t.Run("complex", func(t *testing.T) {
 		testWriteRowsColumns[complexNested](t)
 	})
+	t.Run("mixed write paths", testWriteRowsColumnsMixedWritePaths)
+	t.Run("large level page", testWriteRowsColumnsLargeLevelPage)
+	t.Run("encrypted level page", testWriteRowsColumnsEncryptedLevelPage)
+}
+
+func testWriteRowsColumnsMixedWritePaths(t *testing.T) {
+	type record struct {
+		Optional *int32  `parquet:"optional,optional"`
+		Values   []int32 `parquet:"values,list"`
+	}
+
+	value := int32(7)
+	input := []record{
+		{Values: []int32{}},
+		{Optional: &value, Values: []int32{value, value + 1}},
+	}
+	schema := parquet.SchemaOf(record{})
+	columns := transpose([]parquet.Row{schema.Deconstruct(nil, &input[0])})
+
+	var output bytes.Buffer
+	writer := parquet.NewGenericWriter[record](
+		&output,
+		parquet.DataPageVersion(v2),
+		parquet.PageBufferSize(1),
+	)
+	for column, values := range columns {
+		n, err := writer.ColumnWriters()[column].WriteRowValues(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf("column %d wrote %d rows, want 1", column, n)
+		}
+	}
+	if n, err := writer.Write(input[1:]); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("generic writer wrote %d rows, want 1", n)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := parquet.NewGenericReader[record](bytes.NewReader(output.Bytes()))
+	defer reader.Close()
+	got := make([]record, len(input))
+	if n, err := reader.Read(got); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	} else if n != len(got) {
+		t.Fatalf("reader returned %d rows, want %d", n, len(got))
+	}
+	if !reflect.DeepEqual(got, input) {
+		t.Errorf("round trip mismatch:\n got: %#v\nwant: %#v", got, input)
+	}
+}
+
+func testWriteRowsColumnsLargeLevelPage(t *testing.T) {
+	type record struct {
+		Values []int32 `parquet:"values,list"`
+	}
+
+	input := record{Values: make([]int32, 5000)}
+	for i := range input.Values {
+		input.Values[i] = int32(i)
+	}
+	schema := parquet.SchemaOf(record{})
+	rows := []parquet.Row{schema.Deconstruct(nil, &input)}
+
+	for _, version := range []int{v1, v2} {
+		t.Run(fmt.Sprintf("data-page-v%d", version), func(t *testing.T) {
+			var output bytes.Buffer
+			writer := parquet.NewWriter(
+				&output,
+				schema,
+				parquet.DataPageVersion(version),
+				parquet.PageBufferSize(1<<20),
+			)
+			if n, err := writer.WriteRows(rows); err != nil {
+				t.Fatal(err)
+			} else if n != len(rows) {
+				t.Fatalf("writer wrote %d rows, want %d", n, len(rows))
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reader := parquet.NewGenericReader[record](bytes.NewReader(output.Bytes()))
+			defer reader.Close()
+			got := make([]record, 1)
+			if n, err := reader.Read(got); err != nil && !errors.Is(err, io.EOF) {
+				t.Fatal(err)
+			} else if n != len(got) {
+				t.Fatalf("reader returned %d rows, want %d", n, len(got))
+			}
+			if !reflect.DeepEqual(got[0], input) {
+				t.Errorf("round trip mismatch:\n got: %#v\nwant: %#v", got[0], input)
+			}
+		})
+	}
+}
+
+func testWriteRowsColumnsEncryptedLevelPage(t *testing.T) {
+	type record struct {
+		Values []int32 `parquet:"values,list"`
+	}
+
+	input := record{Values: make([]int32, 5000)}
+	for i := range input.Values {
+		input.Values[i] = int32(i)
+	}
+	schema := parquet.SchemaOf(record{})
+	rows := []parquet.Row{schema.Deconstruct(nil, &input)}
+	footerKey := aes128Key(0xA5)
+
+	var output bytes.Buffer
+	writer := parquet.NewWriter(
+		&output,
+		schema,
+		parquet.DataPageVersion(v2),
+		parquet.PageBufferSize(1<<20),
+		parquet.WithEncryption(&parquet.EncryptionConfig{
+			FooterKey:       footerKey,
+			EncryptedFooter: true,
+			FileIdentifier:  []byte{1, 2, 3, 4, 5, 6, 7, 8},
+		}),
+	)
+	if n, err := writer.WriteRows(rows); err != nil {
+		t.Fatal(err)
+	} else if n != len(rows) {
+		t.Fatalf("writer wrote %d rows, want %d", n, len(rows))
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := parquet.OpenFile(
+		bytes.NewReader(output.Bytes()),
+		int64(output.Len()),
+		parquet.WithDecryption(&staticKeyRetriever{footerKey: footerKey}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := parquet.NewGenericReader[record](file)
+	defer reader.Close()
+	got := make([]record, 1)
+	if n, err := reader.Read(got); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	} else if n != len(got) {
+		t.Fatalf("reader returned %d rows, want %d", n, len(got))
+	}
+	if !reflect.DeepEqual(got[0], input) {
+		t.Errorf("round trip mismatch:\n got: %#v\nwant: %#v", got[0], input)
+	}
 }
 
 func testWriteRowsColumns[T any](t *testing.T) {

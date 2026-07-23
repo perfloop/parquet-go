@@ -203,13 +203,19 @@ func makeWriteFunc[T any](t reflect.Type, writeRows writeRowsFunc) writeFunc[T] 
 		if w.columns == nil {
 			w.columns = make([]ColumnBuffer, len(w.base.writer.currentRowGroup.columns))
 			for i, c := range w.base.writer.currentRowGroup.columns {
-				// These fields are usually lazily initialized when writing rows,
-				// we need them to exist now tho.
-				c.columnBuffer = c.newColumnBuffer()
-				// Record the original buffer so the dictionary-encoded buffer is
-				// restored when the row group is flushed after a fallback to PLAIN
-				// switched the column to a different buffer.
-				c.originalColumnBuffer = c.columnBuffer
+				if _, ok := c.columnBuffer.(*writerLevelsColumnBuffer); ok {
+					if err := c.switchToGenericColumnBuffer(); err != nil {
+						return 0, err
+					}
+				} else {
+					// These fields are usually lazily initialized when writing rows,
+					// we need them to exist now tho.
+					c.columnBuffer = c.newColumnBuffer()
+					// Record the original buffer so the dictionary-encoded buffer is
+					// restored when the row group is flushed after a fallback to PLAIN
+					// switched the column to a different buffer.
+					c.originalColumnBuffer = c.columnBuffer
+				}
 				w.columns[i] = c.columnBuffer
 			}
 		} else {
@@ -967,13 +973,25 @@ func (rg *ConcurrentRowGroupWriter) WriteRows(rows []Row) (int, error) {
 		// we are preventing further use as well?
 		for _, row := range rows[start:end] {
 			for columnIndex, columnValues := range row.Range {
+				column := rg.columns[columnIndex]
+				if column.usesWriterLevelsColumnBuffer() {
+					if err := column.appendWriterLevelValues(columnValues); err != nil {
+						return 0, err
+					}
+					continue
+				}
 				rg.values[columnIndex] = append(rg.values[columnIndex], columnValues...)
 			}
 		}
 
 		for i, values := range rg.values {
+			column := rg.columns[i]
 			if len(values) > 0 {
-				if _, err := rg.columns[i].WriteRowValues(values); err != nil {
+				if _, err := column.WriteRowValues(values); err != nil {
+					return 0, err
+				}
+			} else if column.usesWriterLevelsColumnBuffer() && column.columnBuffer != nil {
+				if err := column.flushWriterLevelBuffer(); err != nil {
 					return 0, err
 				}
 			}
@@ -1857,6 +1875,11 @@ func encodeLevels(dst, src []byte, maxLevel byte) ([]byte, error) {
 	return levelEncodingsRLE[bitWidth-1].EncodeLevels(dst, src)
 }
 
+func appendEncodedLevels(dst, src []byte, maxLevel byte) ([]byte, error) {
+	bitWidth := bits.Len8(maxLevel)
+	return levelEncodingsRLE[bitWidth-1].AppendLevels(dst, src)
+}
+
 func (wb *writerBuffers) encodeRepetitionLevels(page Page, maxRepetitionLevel byte) (err error) {
 	wb.repetitions, err = encodeLevels(wb.repetitions, page.RepetitionLevels(), maxRepetitionLevel)
 	return
@@ -2257,6 +2280,58 @@ func (c *ColumnWriter) newColumnBuffer() ColumnBuffer {
 	}
 }
 
+func (c *ColumnWriter) newRowColumnBuffer() ColumnBuffer {
+	if c.usesWriterLevelsColumnBuffer() {
+		base := c.columnType.NewColumnBuffer(int(c.bufferIndex), 0)
+		return newWriterLevelsColumnBuffer(base, c.maxRepetitionLevel, c.maxDefinitionLevel)
+	}
+	return c.newColumnBuffer()
+}
+
+func (c *ColumnWriter) usesWriterLevelsColumnBuffer() bool {
+	if _, ok := c.columnBuffer.(*writerLevelsColumnBuffer); ok {
+		return true
+	}
+	return c.columnBuffer == nil && c.geospatialAccumulator == nil &&
+		(c.maxRepetitionLevel > 0 || c.maxDefinitionLevel > 0)
+}
+
+// appendWriterLevelValues accepts one raw row without materializing a
+// row-group-sized column slice. Its caller decides when to check the page size.
+func (c *ColumnWriter) appendWriterLevelValues(values []Value) error {
+	if c.columnBuffer == nil {
+		c.columnBuffer = c.newRowColumnBuffer()
+		c.originalColumnBuffer = c.columnBuffer
+	}
+	_, err := c.columnBuffer.WriteValues(values)
+	return err
+}
+
+func (c *ColumnWriter) flushWriterLevelBuffer() error {
+	if c.columnBuffer.Size() >= int64(c.bufferSize) {
+		return c.Flush()
+	}
+	return nil
+}
+
+func (c *ColumnWriter) switchToGenericColumnBuffer() error {
+	if _, ok := c.columnBuffer.(*writerLevelsColumnBuffer); !ok {
+		return nil
+	}
+
+	next := c.newColumnBuffer()
+	if c.columnBuffer.Len() > 0 {
+		if err := c.Flush(); err != nil {
+			return err
+		}
+	}
+	c.originalColumnBuffer = next
+	if !c.hasSwitchedToPlain {
+		c.columnBuffer = next
+	}
+	return nil
+}
+
 // WriteRowValues writes entire rows to the column. On success, this returns the
 // number of rows written (not the number of values).
 //
@@ -2270,7 +2345,7 @@ func (c *ColumnWriter) WriteRowValues(rows []Value) (int, error) {
 	if c.columnBuffer == nil {
 		// Lazily create the row group column so we don't need to allocate it if
 		// rows are not written individually to the column.
-		c.columnBuffer = c.newColumnBuffer()
+		c.columnBuffer = c.newRowColumnBuffer()
 		c.originalColumnBuffer = c.columnBuffer
 	} else {
 		startingRows = int64(c.columnBuffer.Len())
@@ -2305,6 +2380,8 @@ func (c *ColumnWriter) writeValues(values []Value) (numValues int, err error) {
 		if c.originalColumnBuffer == nil {
 			c.originalColumnBuffer = c.columnBuffer
 		}
+	} else if err := c.switchToGenericColumnBuffer(); err != nil {
+		return 0, err
 	}
 	return c.columnBuffer.WriteValues(values)
 }
@@ -2371,11 +2448,17 @@ func (c *ColumnWriter) writeDataPage(page Page) (int64, error) {
 	buf := dataPageBuffers.Get(newWriterBuffers, (*writerBuffers).reset)
 	defer dataPageBuffers.Put(buf)
 
-	if c.maxRepetitionLevel > 0 {
-		buf.encodeRepetitionLevels(page, c.maxRepetitionLevel)
-	}
-	if c.maxDefinitionLevel > 0 {
-		buf.encodeDefinitionLevels(page, c.maxDefinitionLevel)
+	if levelsPage, ok := page.(*writerLevelsPage); ok {
+		if err := levelsPage.copyEncodedLevels(buf); err != nil {
+			return 0, fmt.Errorf("encoding parquet data page levels: %w", err)
+		}
+	} else {
+		if c.maxRepetitionLevel > 0 {
+			buf.encodeRepetitionLevels(page, c.maxRepetitionLevel)
+		}
+		if c.maxDefinitionLevel > 0 {
+			buf.encodeDefinitionLevels(page, c.maxDefinitionLevel)
+		}
 	}
 
 	if err := buf.encode(page, c.encoding); err != nil {
@@ -2734,25 +2817,42 @@ func (c *ColumnWriter) recordPageStats(headerSize int32, header *format.PageHead
 		c.numRows += page.NumRows()
 		c.totalUnencodedByteArrayBytes += computeUnencodedByteArraySize(page)
 
-		repetitionLevels := page.RepetitionLevels()
-		definitionLevels := page.DefinitionLevels()
+		if levelsPage, ok := page.(*writerLevelsPage); ok {
+			if c.maxRepetitionLevel > 0 {
+				c.pageRepetitionLevelHistograms = appendWriterLevelHistogram(
+					c.repetitionLevelHistogram,
+					c.pageRepetitionLevelHistograms,
+					levelsPage.repetitionHistogram,
+				)
+			}
+			if c.maxDefinitionLevel > 0 {
+				c.pageDefinitionLevelHistograms = appendWriterLevelHistogram(
+					c.definitionLevelHistogram,
+					c.pageDefinitionLevelHistograms,
+					levelsPage.definitionHistogram,
+				)
+			}
+		} else {
+			repetitionLevels := page.RepetitionLevels()
+			definitionLevels := page.DefinitionLevels()
 
-		if c.maxRepetitionLevel > 0 {
-			c.pageRepetitionLevelHistograms = accumulateAndAppendPageLevelHistogram(
-				c.repetitionLevelHistogram,
-				c.pageRepetitionLevelHistograms,
-				repetitionLevels,
-				c.maxRepetitionLevel,
-			)
-		}
+			if c.maxRepetitionLevel > 0 {
+				c.pageRepetitionLevelHistograms = accumulateAndAppendPageLevelHistogram(
+					c.repetitionLevelHistogram,
+					c.pageRepetitionLevelHistograms,
+					repetitionLevels,
+					c.maxRepetitionLevel,
+				)
+			}
 
-		if c.maxDefinitionLevel > 0 {
-			c.pageDefinitionLevelHistograms = accumulateAndAppendPageLevelHistogram(
-				c.definitionLevelHistogram,
-				c.pageDefinitionLevelHistograms,
-				definitionLevels,
-				c.maxDefinitionLevel,
-			)
+			if c.maxDefinitionLevel > 0 {
+				c.pageDefinitionLevelHistograms = accumulateAndAppendPageLevelHistogram(
+					c.definitionLevelHistogram,
+					c.pageDefinitionLevelHistograms,
+					definitionLevels,
+					c.maxDefinitionLevel,
+				)
+			}
 		}
 	}
 

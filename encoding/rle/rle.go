@@ -45,6 +45,14 @@ func (e *Encoding) EncodeLevels(dst []byte, src []uint8) ([]byte, error) {
 	return dst, e.wrap(err)
 }
 
+// AppendLevels appends a hybrid RLE/bit-packed representation of src to dst.
+// Each appended sequence is independently decodable, so callers may build a
+// complete level stream from bounded input batches without retaining all levels.
+func (e *Encoding) AppendLevels(dst []byte, src []uint8) ([]byte, error) {
+	dst, err := encodeBytes(dst, src, uint(e.BitWidth))
+	return dst, e.wrap(err)
+}
+
 func (e *Encoding) EncodeBoolean(dst []byte, src []byte) ([]byte, error) {
 	// In the case of encoding a boolean values, the 4 bytes length of the
 	// output is expected by the parquet format. We add the bytes as placeholder
