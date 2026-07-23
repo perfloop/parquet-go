@@ -436,7 +436,9 @@ func (w *SortingWriter[T]) sortAndWriteBufferedRows() error {
 		return nil
 	}
 
-	inputWasSorted := sort.IsSorted(w.rowbuf)
+	firstCompactRun := w.inMemoryInt64Runs != nil &&
+		len(w.inMemoryInt64Runs.runs) == 0 && len(w.rowbuf.rows) > 1
+	inputWasSorted := firstCompactRun && sort.IsSorted(w.rowbuf)
 	sort.Sort(w.rowbuf)
 
 	if w.sorting.DropDuplicatedRows {
@@ -451,8 +453,7 @@ func (w *SortingWriter[T]) sortAndWriteBufferedRows() error {
 		}
 		// Avoid compact-first replay when a multi-row stream begins sorted: the
 		// materialized path can preserve its chunk-oriented close behavior.
-		if (len(w.inMemoryInt64Runs.runs) == 0 && len(w.rowbuf.rows) > 1 && inputWasSorted) ||
-			w.inMemoryInt64Runs.shouldMaterialize(w.rowbuf.rows) {
+		if inputWasSorted || w.inMemoryInt64Runs.shouldMaterialize(w.rowbuf.rows) {
 			if err := w.materializeInMemoryInt64Runs(); err != nil {
 				return err
 			}
