@@ -463,9 +463,12 @@ func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
 			return false
 		}
 		for columnIndex := range buf.columns {
-			value := byteArrayRowValue(row, columnIndex)
-			if value == nil {
-				return false
+			value := &row[columnIndex]
+			if value.columnIndex != ^uint16(columnIndex) {
+				value = findByteArrayRowValue(row, columnIndex)
+				if value == nil {
+					return false
+				}
 			}
 			byteArraySizes[columnIndex] += int(value.u64)
 		}
@@ -477,11 +480,7 @@ func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
 	return true
 }
 
-func byteArrayRowValue(row Row, columnIndex int) *Value {
-	value := &row[columnIndex]
-	if value.columnIndex == ^uint16(columnIndex) {
-		return value
-	}
+func findByteArrayRowValue(row Row, columnIndex int) *Value {
 	for i := range row {
 		if row[i].columnIndex == ^uint16(columnIndex) {
 			return &row[i]

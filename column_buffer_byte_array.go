@@ -159,7 +159,10 @@ func (col *byteArrayColumnBuffer) writeRows(rows []Row, columnIndex, totalBytes 
 
 	valueOffset := valuesStart
 	for i, row := range rows {
-		value := byteArrayRowValue(row, columnIndex)
+		value := &row[columnIndex]
+		if value.columnIndex != ^uint16(columnIndex) {
+			value = findByteArrayRowValue(row, columnIndex)
+		}
 		valueLen := int(value.u64)
 		offsets[i] = uint32(valueOffset)
 		lengths[i] = uint32(valueLen)
