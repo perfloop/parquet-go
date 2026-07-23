@@ -1,6 +1,7 @@
 package parquet
 
 import (
+	"errors"
 	"io"
 	"sync/atomic"
 )
@@ -179,11 +180,16 @@ func (w *Writer) configureBloomFiltersForSegments(segments []RowGroup) {
 func (w *Writer) writeRowGroupByColumn(columns []ColumnChunk) error {
 	dst := w.writer.currentRowGroup.columns
 	for i, col := range columns {
-		if src, ok := col.(*FileColumnChunk); ok && !disableWriteTranscode && columnChunkIsTranscodable(dst[i], src) {
-			if err := dst[i].loadTranscodedChunk(src); err != nil {
+		if src, ok := col.(*FileColumnChunk); ok && columnChunkIsTranscodable(dst[i], src) {
+			if err := dst[i].loadTranscodedChunk(src); err == nil {
+				continue
+			} else if !errors.Is(err, errTranscodeFallback) {
 				return err
 			}
-			continue
+			// loadTranscodedChunk may learn from a raw page header that the
+			// persisted encoding metadata was incomplete. Discard any staged
+			// pages before retaining the existing L3 behavior.
+			dst[i].reset()
 		}
 		if err := copyColumnValues(dst[i], col); err != nil {
 			return err

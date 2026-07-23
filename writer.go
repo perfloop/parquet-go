@@ -1529,14 +1529,16 @@ func (w *writer) writeRowGroup(rg *ConcurrentRowGroupWriter, rowGroupSchema *Sch
 			continue
 		}
 
-		if c.transcoded != nil {
-			rg.columnIndex[i] = c.transcoded.columnIndex
-			c.columnChunk.MetaData.SizeStatistics = c.transcoded.sizeStats
-		} else {
-			rg.columnIndex[i] = c.columnIndex.ColumnIndex()
-			rg.columnIndex[i].RepetitionLevelHistogram = append(rg.columnIndex[i].RepetitionLevelHistogram[:0], c.pageRepetitionLevelHistograms...)
-			rg.columnIndex[i].DefinitionLevelHistogram = append(rg.columnIndex[i].DefinitionLevelHistogram[:0], c.pageDefinitionLevelHistograms...)
+		rg.columnIndex[i] = c.columnIndex.ColumnIndex()
+		rg.columnIndex[i].RepetitionLevelHistogram = append(rg.columnIndex[i].RepetitionLevelHistogram[:0], c.pageRepetitionLevelHistograms...)
+		rg.columnIndex[i].DefinitionLevelHistogram = append(rg.columnIndex[i].DefinitionLevelHistogram[:0], c.pageDefinitionLevelHistograms...)
 
+		if c.transcoded != nil {
+			// L2 admits BYTE_ARRAY columns only when every data page uses a
+			// dictionary, whose size statistics are empty in L3 as well. The flat
+			// layout has no level histograms, so an empty value matches L3.
+			c.columnChunk.MetaData.SizeStatistics = format.SizeStatistics{}
+		} else {
 			c.columnChunk.MetaData.SizeStatistics = format.SizeStatistics{
 				UnencodedByteArrayDataBytes: c.totalUnencodedByteArrayBytes,
 				RepetitionLevelHistogram:    slices.Clone(c.repetitionLevelHistogram),

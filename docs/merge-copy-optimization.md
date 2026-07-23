@@ -332,48 +332,51 @@ layout requirements do not hold.
 
 #### L2 — transcode compression, skip value decode
 
-Fires when, per column chunk: physical type matches, **encoding matches**, data
-page version matches, no encryption, no writer-requested bloom filter, source
-column + offset index present, and the **codec differs** from the writer's
-configured codec (if the codec also matched, that is L0).
+Fires when, per column chunk: physical type and **encoding match**, pages use
+DataPageV2, the column is flat (no repetition/definition levels), the
+writer's default page-statistics/bounds policy is in effect, no encryption or
+writer-requested bloom filter is present, and the **codec differs** from the
+writer's configured codec (if the codec also matched, that is L0). `BYTE_ARRAY`
+columns enter L2 only when every data page uses dictionary encoding and the
+destination has no dictionary-size limit; other layouts deliberately remain on
+L3.
 
 Per-page transcode (validated against the decode path in `column.go`):
 
-- **DataPage (v1) and DictionaryPage:** the whole body is one compressed blob.
-  `decompressed = srcCodec.Decode(body)`; `newBody = dstCodec.Encode(decompressed)`.
-- **DataPageV2:** the body is
-  `[rep levels: RepetitionLevelsByteLength bytes][def levels:
-  DefinitionLevelsByteLength bytes][compressed values]`; the levels are
-  **uncompressed**. So `levelsLen = repLen + defLen`; keep `body[:levelsLen]`
-  verbatim, recompress only `body[levelsLen:]`:
-  `newBody = body[:levelsLen] ++ dstCodec.Encode(srcCodec.Decode(body[levelsLen:]))`.
-  Respect `IsCompressed` (false ⇒ source values are raw).
+- **DictionaryPage and flat DataPageV2:** each eligible body is one compressed
+  blob. `decompressed = srcCodec.Decode(body)`;
+  `newBody = dstCodec.Encode(decompressed)`. DataPageV2 pages with level
+  prefixes (or nulls) stay on L3, where their level histograms are rebuilt.
 - Rewrite the page header: new `CompressedPageSize`, recomputed CRC;
   `UncompressedPageSize`, encoding, levels lengths, num values, and page
   statistics are unchanged.
 
 Because the codec change alters compressed sizes, L2 cannot stream a contiguous
 range like L0. It transcodes page-by-page into a staging buffer and rebuilds the
-**offset index** from the new per-page compressed sizes. The **column index** and
-chunk statistics are codec-independent, so they are copied verbatim from the
-source (as in L0). `TotalCompressedSize` is recomputed.
+**offset index**, **column index**, and chunk statistics from DataPageV2 headers
+rather than trusting persisted source indexes/statistics. `TotalCompressedSize`
+is recomputed. Plain/delta `BYTE_ARRAY` pages remain on L3 because their size
+statistics require decoded values; dictionary-only `BYTE_ARRAY` chunks emit the
+same empty size statistics as L3.
 
 Implementation: `writer_transcode.go` reads the chunk section
 `[baseOffset, +TotalCompressedSize)`, decodes each `format.PageHeader` followed
 by its `CompressedPageSize` body bytes (the same seam `FilePages.readPage` uses
 before decode), and uses `compress.Codec.Encode/Decode`, `crc32.ChecksumIEEE`,
-and the thrift encoder to rebuild the page. `columnChunkIsTranscodable` is the
+and the thrift encoder to rebuild the page. It uses the immutable layout snapshot
+captured when `OpenFile` constructed the `FileColumnChunk`, rather than the
+publicly mutable `File.Metadata` footer. `columnChunkIsTranscodable` is the
 per-chunk L2 predicate; it leaves any ineligible chunk on L3.
 
 L2 stages transcoded data pages in the column's page buffer (reintroducing the
 buffering that L0 avoids — acceptable here since L2 is already CPU-bound on
-(de)compression) plus a transcoded dictionary page and copied column index;
+(de)compression) plus a transcoded dictionary page and rebuilt column index;
 `writeRowGroup` writes the staged pages and rebuilt offset index.
 
-Risk: page-layout surgery (esp. the V2 levels boundary), CRC, and offset-index
-rebuild — all file-corruption-class if wrong. Mitigation: round-trip tests cover
-both data-page versions, dictionary pages, decoded values, and column/offset
-indexes, with a direct L2-versus-L3 comparison for a codec migration.
+Risk: page-layout surgery, CRC, and offset-index rebuild — all
+file-corruption-class if wrong. Mitigation: round-trip tests cover the eligible
+flat V2/dictionary layout, decoded values, rebuilt metadata and column/offset
+indexes; CRC-corrupt and encrypted sources are rejected or demoted to L3.
 
 Cost model: L2 skips value decode + re-encode but keeps (de)compression; its
 benefit therefore depends on how much of a rewrite's cost is value processing

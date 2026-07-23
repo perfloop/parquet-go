@@ -491,18 +491,15 @@ func TestWriteRowGroupCopyMergeNonOverlapping(t *testing.T) {
 // actually fires (config differs from source, so L0 cannot apply).
 func TestWriteRowGroupReencodeMatchesRowPath(t *testing.T) {
 	rows := makeCopyTestRows(5000)
-	src := writeCopyTestFile(t, rows, Compression(&Snappy))
+	// The real page-version mismatch keeps this test on L3 while the codec
+	// mismatch prevents L0; it needs no production-only test switch.
+	src := writeCopyTestFile(t, rows, Compression(&Snappy), DataPageVersion(1))
 
 	rewrite := func(reencode bool) []byte {
-		defer func(reencodeDisabled, transcodeDisabled bool) {
-			disableWriteReencode = reencodeDisabled
-			disableWriteTranscode = transcodeDisabled
-		}(disableWriteReencode, disableWriteTranscode)
+		defer func(prev bool) { disableWriteReencode = prev }(disableWriteReencode)
 		disableWriteReencode = !reencode
-		disableWriteTranscode = true
 		var dst bytes.Buffer
-		// Codec differs from source (Snappy -> Zstd) so L0 cannot fire.
-		w := NewGenericWriter[copyTestRow](&dst, Compression(&Zstd))
+		w := NewGenericWriter[copyTestRow](&dst, Compression(&Zstd), DataPageVersion(2))
 		for _, rg := range src.RowGroups() {
 			if _, err := w.WriteRowGroup(rg); err != nil {
 				t.Fatalf("WriteRowGroup(reencode=%v): %v", reencode, err)
@@ -531,51 +528,40 @@ func TestWriteRowGroupReencodeMatchesRowPath(t *testing.T) {
 	}
 }
 
-// TestWriteRowGroupTranscodeMatchesReencode verifies that the raw-page path is
-// selected for a codec migration and preserves the L3 path's decoded rows.
-func TestWriteRowGroupTranscodeMatchesReencode(t *testing.T) {
+// TestWriteRowGroupTranscodePreservesRows verifies that the raw-page path is
+// selected for eligible columns in a compatible codec migration and preserves
+// decoded rows for the whole row group.
+func TestWriteRowGroupTranscodePreservesRows(t *testing.T) {
 	rows := makeCopyTestRows(5000)
 	src := writeCopyTestFile(t, rows, Compression(&Snappy), PageBufferSize(512))
 
-	rewrite := func(transcode bool) []byte {
-		defer func(prev bool) { disableWriteTranscode = prev }(disableWriteTranscode)
-		disableWriteTranscode = !transcode
-
-		var dst bytes.Buffer
-		w := NewGenericWriter[copyTestRow](&dst, Compression(&Zstd), PageBufferSize(512))
-		for _, rg := range src.RowGroups() {
-			if _, err := w.WriteRowGroup(rg); err != nil {
-				t.Fatalf("WriteRowGroup(transcode=%v): %v", transcode, err)
-			}
-		}
-		if err := w.Close(); err != nil {
-			t.Fatal(err)
-		}
-		return dst.Bytes()
-	}
-
 	before := transcodePathCounter.Load()
-	l2 := rewrite(true)
-	if transcoded := transcodePathCounter.Load() - before; transcoded == 0 {
-		t.Fatal("expected the L2 raw-page transcode path to fire")
+	var dst bytes.Buffer
+	w := NewGenericWriter[copyTestRow](&dst, Compression(&Zstd), PageBufferSize(512))
+	for _, rg := range src.RowGroups() {
+		if _, err := w.WriteRowGroup(rg); err != nil {
+			t.Fatalf("WriteRowGroup: %v", err)
+		}
 	}
-	l3 := rewrite(false)
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if transcoded, want := transcodePathCounter.Load()-before, int64(copyTestColumnCount); transcoded != want {
+		t.Fatalf("transcoded %d columns, want %d", transcoded, want)
+	}
 
-	gotL2 := readCopyTestRows(t, l2, len(rows))
-	gotL3 := readCopyTestRows(t, l3, len(rows))
-	if !reflect.DeepEqual(gotL2, rows) {
+	got := readCopyTestRows(t, dst.Bytes(), len(rows))
+	if !reflect.DeepEqual(got, rows) {
 		t.Fatal("L2 output differs from source data")
-	}
-	if !reflect.DeepEqual(gotL2, gotL3) {
-		t.Fatal("L2 output differs from L3 output")
 	}
 }
 
-// BenchmarkWriteRowGroupReencodePaths compares the L3 column-oriented re-encode
-// against the row-oriented fallback. The codec differs from the source (Snappy)
-// so L0 cannot fire. The "uncompressed" dest isolates the row round-trip cost
-// (no compression in the write); the "zstd" dest reflects a realistic codec
-// migration.
+// BenchmarkWriteRowGroupReencodePaths compares the column-oriented rewrite
+// against the row-oriented fallback. The retained /L3 selector names the
+// baseline arm: before L2 exists it uses L3, while an eligible candidate must
+// select L2 (asserted below). The codec differs from the source (Snappy), so L0
+// cannot fire. The "uncompressed" dest isolates the row round-trip cost; the
+// "zstd" dest reflects a realistic codec migration.
 func BenchmarkWriteRowGroupReencodePaths(b *testing.B) {
 	rows := makeBenchRows(200_000)
 	var src bytes.Buffer
@@ -591,10 +577,21 @@ func BenchmarkWriteRowGroupReencodePaths(b *testing.B) {
 		b.Fatal(err)
 	}
 	rowGroups := file.RowGroups()
+	eligibleColumns := int64(0)
+	for _, column := range rowGroups[0].ColumnChunks() {
+		if column.Type().Kind() != ByteArray ||
+			column.(*FileColumnChunk).chunk.MetaData.DictionaryPageOffset != 0 {
+			eligibleColumns++
+		}
+	}
+	if eligibleColumns == 0 {
+		b.Fatal("benchmark has no eligible columns")
+	}
 
-	run := func(b *testing.B, compression WriterOption, reencode bool) {
+	run := func(b *testing.B, compression WriterOption, columnPath bool) {
 		defer func(d bool) { disableWriteReencode = d }(disableWriteReencode)
-		disableWriteReencode = !reencode
+		disableWriteReencode = !columnPath
+		beforeTranscode := transcodePathCounter.Load()
 		b.ReportAllocs()
 		b.SetBytes(int64(src.Len()))
 		b.ResetTimer()
@@ -607,6 +604,14 @@ func BenchmarkWriteRowGroupReencodePaths(b *testing.B) {
 			}
 			if err := w.Close(); err != nil {
 				b.Fatal(err)
+			}
+		}
+		b.StopTimer()
+		if columnPath {
+			got := transcodePathCounter.Load() - beforeTranscode
+			want := int64(b.N*len(rowGroups)) * eligibleColumns
+			if got != want {
+				b.Fatalf("L2 transcodes = %d, want %d", got, want)
 			}
 		}
 	}

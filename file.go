@@ -680,16 +680,25 @@ func (g *FileRowGroup) init(file *File, columns []*Column, rowGroup *format.RowG
 	fileOffsetIndexes := make([]FileOffsetIndex, len(rowGroup.Columns))
 
 	for i := range g.columns {
+		chunk := &rowGroup.Columns[i]
+		meta := &chunk.MetaData
 		fileColumnChunks[i] = FileColumnChunk{
 			file:            file,
 			column:          columns[i],
 			rowGroup:        rowGroup,
-			chunk:           &rowGroup.Columns[i],
+			chunk:           chunk,
 			columnOrdinal:   int16(i),
 			rowGroupOrdinal: rowGroup.Ordinal,
+			source: fileColumnChunkSource{
+				codec:                meta.Codec,
+				dataPageOffset:       meta.DataPageOffset,
+				dictionaryPageOffset: meta.DictionaryPageOffset,
+				totalCompressedSize:  meta.TotalCompressedSize,
+				encodingStats:        slices.Clone(meta.EncodingStats),
+				encrypted:            chunk.CryptoMetadata.Value != nil,
+			},
 		}
 		if file.decryption != nil {
-			chunk := &rowGroup.Columns[i]
 			switch crypto := chunk.CryptoMetadata.Value.(type) {
 			case *format.EncryptionWithFooterKey:
 				key, err := file.decryption.Keys.FooterKey(nil)
@@ -800,6 +809,7 @@ type FileColumnChunk struct {
 	column      *Column
 	rowGroup    *format.RowGroup
 	chunk       *format.ColumnChunk
+	source      fileColumnChunkSource
 	columnIndex atomic.Pointer[FileColumnIndex]
 	offsetIndex atomic.Pointer[FileOffsetIndex]
 	bloomFilter atomic.Pointer[FileBloomFilter]
@@ -808,6 +818,18 @@ type FileColumnChunk struct {
 	decryptionKey   []byte
 	columnOrdinal   int16
 	rowGroupOrdinal int16
+}
+
+// fileColumnChunkSource snapshots the physical layout decoded at OpenFile time.
+// File.Metadata exposes live footer metadata, so raw-byte consumers must not use
+// it as the identity of an already constructed FileColumnChunk.
+type fileColumnChunkSource struct {
+	codec                format.CompressionCodec
+	dataPageOffset       int64
+	dictionaryPageOffset int64
+	totalCompressedSize  int64
+	encodingStats        []format.PageEncodingStats
+	encrypted            bool
 }
 
 // File returns the file that this column chunk belongs to.
