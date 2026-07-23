@@ -456,24 +456,21 @@ func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
 	}
 
 	numColumns := len(buf.columns)
-	firstColumn := ^uint16(0)
-	lastColumn := ^uint16(numColumns - 1)
 	for _, row := range rows {
-		if len(row) != numColumns ||
-			row[0].columnIndex != firstColumn ||
-			row[numColumns-1].columnIndex != lastColumn {
+		if len(row) != numColumns {
 			return false
+		}
+		for columnIndex, value := range row {
+			if value.columnIndex != ^uint16(columnIndex) {
+				return false
+			}
 		}
 	}
 
 	byteArraySizes := buf.byteArraySizes
 	clear(byteArraySizes)
 	for _, row := range rows {
-		for columnIndex := range row {
-			value := &row[columnIndex]
-			if value.columnIndex != ^uint16(columnIndex) {
-				return false
-			}
+		for columnIndex, value := range row {
 			byteArraySizes[columnIndex] += int(value.u64)
 		}
 	}
