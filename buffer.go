@@ -408,10 +408,6 @@ func (buf *Buffer) Write(row any) error {
 
 // WriteRows writes parquet rows to the buffer.
 func (buf *Buffer) WriteRows(rows []Row) (int, error) {
-	if buf.schema == nil {
-		return 0, ErrRowGroupSchemaMissing
-	}
-
 	if buf.writeByteArrayRows(rows) {
 		return len(rows), nil
 	}
@@ -422,6 +418,10 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 			buf.colbuf[i] = colbuf[:0]
 		}
 	}()
+
+	if buf.schema == nil {
+		return 0, ErrRowGroupSchemaMissing
+	}
 
 	for _, row := range rows {
 		for _, value := range row {
