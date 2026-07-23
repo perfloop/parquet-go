@@ -71,8 +71,9 @@ func decodeGoObject(m Metadata, header byte, data []byte) (any, error) {
 		pos++
 	}
 
-	// Match Decode's pre-allocation bounds check. The direct decoder then reads
-	// field IDs and offsets from their tables in-place instead of retaining them.
+	// Match Decode's pre-allocation bounds check. It guarantees every field-ID
+	// and non-terminal offset slot; the direct decoder reads those tables
+	// in-place instead of retaining them.
 	if remaining := len(data) - pos; numElements < 0 ||
 		remaining/(fieldIDSize+offsetSz) < numElements {
 		return nil, fmt.Errorf("variant value: object element count %d exceeds data", numElements)
@@ -95,10 +96,7 @@ func decodeGoObject(m Metadata, header byte, data []byte) (any, error) {
 	fieldIDPos := fieldIDsStart
 	offsetPos := offsetsStart
 	for i := range numElements {
-		fieldID, _, err := readUint(data[fieldIDPos:], fieldIDSize)
-		if err != nil {
-			return nil, fmt.Errorf("variant value: reading object field id %d: %w", i, err)
-		}
+		fieldID, _, _ := readUint(data[fieldIDPos:], fieldIDSize)
 		fieldIDPos += fieldIDSize
 
 		name, err := m.Lookup(fieldID)
@@ -109,10 +107,7 @@ func decodeGoObject(m Metadata, header byte, data []byte) (any, error) {
 			return nil, fmt.Errorf("variant value: duplicate object field %q", name)
 		}
 
-		offset, _, err := readUint(data[offsetPos:], offsetSz)
-		if err != nil {
-			return nil, fmt.Errorf("variant value: reading object offset %d: %w", i, err)
-		}
+		offset, _, _ := readUint(data[offsetPos:], offsetSz)
 		offsetPos += offsetSz
 		valueStart := valueDataStart + offset
 		if valueStart < valueDataStart || valueStart > valueDataEnd {
