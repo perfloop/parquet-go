@@ -14,9 +14,9 @@ import (
 // reaches the target number of rows, then written to a temporary row group.
 // When the writer is flushed or closed, the temporary row groups are merged
 // into a row group in the output file, ensuring that rows remain sorted in the
-// final row group. Required INT64 layouts using the built-in in-memory pool and
-// no compression retain compact run values instead of materializing temporary
-// row groups.
+// final row group. Required INT64 layouts with one ascending sorting column,
+// using the built-in in-memory pool and no compression, retain compact run
+// values instead of materializing temporary row groups.
 //
 // Encoded and compressed temporary row groups hold a lot less memory than if
 // all rows were retained in memory. Sorting then merging rows chunks also tends
@@ -25,7 +25,7 @@ import (
 // of cache misses since the data set cannot be held in CPU caches.
 type SortingWriter[T any] struct {
 	rowbuf            *RowBuffer[T]
-	writer            *GenericWriter[T]
+	writer            *GenericWriter[T] // temporary-run fallback only
 	output            *GenericWriter[T]
 	buffer            io.ReadWriteSeeker
 	inMemoryInt64Runs *inMemoryInt64Runs
@@ -55,18 +55,6 @@ func NewSortingWriter[T any](output io.Writer, sortRowCount int64, options ...Wr
 			Schema:  config.Schema,
 			Sorting: config.Sorting,
 		}),
-		writer: NewGenericWriter[T](io.Discard, &WriterConfig{
-			CreatedBy:            config.CreatedBy,
-			ColumnPageBuffers:    config.ColumnPageBuffers,
-			ColumnIndexSizeLimit: config.ColumnIndexSizeLimit,
-			PageBufferSize:       config.PageBufferSize,
-			WriteBufferSize:      config.WriteBufferSize,
-			DataPageVersion:      config.DataPageVersion,
-			Schema:               config.Schema,
-			Compression:          config.Compression,
-			Sorting:              config.Sorting,
-			Encodings:            config.Encodings,
-		}),
 		output:  NewGenericWriter[T](output, config),
 		maxRows: sortRowCount,
 		sorting: config.Sorting,
@@ -77,6 +65,20 @@ func NewSortingWriter[T any](output io.Writer, sortRowCount int64, options ...Wr
 			config.Sorting,
 			config.Sorting.SortingBuffers,
 		)
+	}
+	if w.inMemoryInt64Runs == nil {
+		w.writer = NewGenericWriter[T](io.Discard, &WriterConfig{
+			CreatedBy:            config.CreatedBy,
+			ColumnPageBuffers:    config.ColumnPageBuffers,
+			ColumnIndexSizeLimit: config.ColumnIndexSizeLimit,
+			PageBufferSize:       config.PageBufferSize,
+			WriteBufferSize:      config.WriteBufferSize,
+			DataPageVersion:      config.DataPageVersion,
+			Schema:               config.Schema,
+			Compression:          config.Compression,
+			Sorting:              config.Sorting,
+			Encodings:            config.Encodings,
+		})
 	}
 	return w
 }
@@ -158,7 +160,9 @@ func (w *SortingWriter[T]) Reset(output io.Writer) {
 }
 
 func (w *SortingWriter[T]) resetSortingBuffer() {
-	w.writer.Reset(io.Discard)
+	if w.writer != nil {
+		w.writer.Reset(io.Discard)
+	}
 	w.numRows = 0
 
 	if w.inMemoryInt64Runs != nil {
