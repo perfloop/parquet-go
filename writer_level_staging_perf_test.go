@@ -165,22 +165,34 @@ func assertWriterLevelStagingMetadata(t *testing.T, file *parquet.File, want []w
 	indexes := file.ColumnIndexes()
 	for column, histogram := range want {
 		if len(histogram.definitions) > 1 {
-			if got := columns[column].MetaData.SizeStatistics.DefinitionLevelHistogram; !reflect.DeepEqual(got, histogram.definitions) {
+			if got := columns[column].MetaData.SizeStatistics.DefinitionLevelHistogram; !equalWriterLevelStagingHistogram(got, histogram.definitions) {
 				t.Errorf("column %d definition histogram = %v, want %v", column, got, histogram.definitions)
 			}
-			if got := sumWriterLevelStagingPageHistograms(indexes[column].DefinitionLevelHistogram, len(histogram.definitions)); !reflect.DeepEqual(got, histogram.definitions) {
+			if got := sumWriterLevelStagingPageHistograms(indexes[column].DefinitionLevelHistogram, len(histogram.definitions)); !equalWriterLevelStagingHistogram(got, histogram.definitions) {
 				t.Errorf("column %d aggregate column-index definition histogram = %v, want %v", column, got, histogram.definitions)
 			}
 		}
 		if len(histogram.repetitions) > 1 {
-			if got := columns[column].MetaData.SizeStatistics.RepetitionLevelHistogram; !reflect.DeepEqual(got, histogram.repetitions) {
+			if got := columns[column].MetaData.SizeStatistics.RepetitionLevelHistogram; !equalWriterLevelStagingHistogram(got, histogram.repetitions) {
 				t.Errorf("column %d repetition histogram = %v, want %v", column, got, histogram.repetitions)
 			}
-			if got := sumWriterLevelStagingPageHistograms(indexes[column].RepetitionLevelHistogram, len(histogram.repetitions)); !reflect.DeepEqual(got, histogram.repetitions) {
+			if got := sumWriterLevelStagingPageHistograms(indexes[column].RepetitionLevelHistogram, len(histogram.repetitions)); !equalWriterLevelStagingHistogram(got, histogram.repetitions) {
 				t.Errorf("column %d aggregate column-index repetition histogram = %v, want %v", column, got, histogram.repetitions)
 			}
 		}
 	}
+}
+
+func equalWriterLevelStagingHistogram(got, want []int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func sumWriterLevelStagingPageHistograms(pageHistograms []int64, numLevels int) []int64 {
