@@ -1,6 +1,7 @@
 package parquet
 
 import (
+	"errors"
 	"io"
 	"slices"
 	"sort"
@@ -197,23 +198,40 @@ func newInMemoryInt64Runs(schema *Schema, sorting SortingConfig, pool BufferPool
 	return &inMemoryInt64Runs{columns: len(columns)}
 }
 
+var errInvalidInMemoryInt64Row = errors.New("invalid row for in-memory INT64 sorting run")
+
 type inMemoryInt64Runs struct {
 	columns int
-	runs    []inMemoryInt64Run
+	runs    [][]int64
 }
 
-type inMemoryInt64Run struct {
-	values []int64
+func (r *inMemoryInt64Runs) validateRows(rows []Row) error {
+	for _, row := range rows {
+		if len(row) != r.columns {
+			return errInvalidInMemoryInt64Row
+		}
+		for column, value := range row {
+			if value.Column() != column ||
+				value.Kind() != Int64 ||
+				value.RepetitionLevel() != 0 ||
+				value.DefinitionLevel() != 0 {
+				return errInvalidInMemoryInt64Row
+			}
+		}
+	}
+	return nil
 }
 
 func (r *inMemoryInt64Runs) appendRows(rows []Row) {
 	values := make([]int64, len(rows)*r.columns)
+	// validateRows establishes positional identity before sorting, which keeps
+	// the compact store and RowBuffer's comparator in agreement.
 	for i, row := range rows {
-		for _, value := range row {
-			values[i*r.columns+value.Column()] = value.Int64()
+		for column, value := range row {
+			values[i*r.columns+column] = value.Int64()
 		}
 	}
-	r.runs = append(r.runs, inMemoryInt64Run{values: values})
+	r.runs = append(r.runs, values)
 }
 
 func (r *inMemoryInt64Runs) reset() {
@@ -224,7 +242,7 @@ func (r *inMemoryInt64Runs) writeTo(dst RowWriter, compare func(Row, Row) int, d
 	readers := make([]RowReader, len(r.runs))
 	for i := range r.runs {
 		readers[i] = &inMemoryInt64RunReader{
-			run:     &r.runs[i],
+			values:  r.runs[i],
 			columns: r.columns,
 		}
 	}
@@ -238,23 +256,23 @@ func (r *inMemoryInt64Runs) writeTo(dst RowWriter, compare func(Row, Row) int, d
 }
 
 type inMemoryInt64RunReader struct {
-	run     *inMemoryInt64Run
+	values  []int64
 	columns int
 	offset  int
 }
 
 func (r *inMemoryInt64RunReader) ReadRows(rows []Row) (int, error) {
-	n := min(len(rows), len(r.run.values)/r.columns-r.offset)
+	n := min(len(rows), len(r.values)/r.columns-r.offset)
 	for i := range n {
 		values := rows[i][:0]
 		for column := range r.columns {
-			value := r.run.values[(r.offset+i)*r.columns+column]
+			value := r.values[(r.offset+i)*r.columns+column]
 			values = append(values, Int64Value(value).Level(0, 0, column))
 		}
 		rows[i] = values
 	}
 	r.offset += n
-	if r.offset == len(r.run.values)/r.columns {
+	if r.offset == len(r.values)/r.columns {
 		return n, io.EOF
 	}
 	return n, nil
@@ -265,6 +283,11 @@ func (w *SortingWriter[T]) Write(rows []T) (int, error) {
 }
 
 func (w *SortingWriter[T]) WriteRows(rows []Row) (int, error) {
+	if w.inMemoryInt64Runs != nil {
+		if err := w.inMemoryInt64Runs.validateRows(rows); err != nil {
+			return 0, err
+		}
+	}
 	return w.writeRows(len(rows), func(i, j int) (int, error) { return w.rowbuf.WriteRows(rows[i:j]) })
 }
 
