@@ -2,6 +2,7 @@ package parquet_test
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,8 @@ import (
 	"github.com/parquet-go/parquet-go/encoding"
 	"github.com/parquet-go/parquet-go/encoding/thrift"
 	"github.com/parquet-go/parquet-go/format"
+	geom "github.com/twpayne/go-geom"
+	"github.com/twpayne/go-geom/encoding/wkb"
 )
 
 const (
@@ -306,6 +309,8 @@ func TestWriteRowsColumns(t *testing.T) {
 		testWriteRowsColumns[complexNested](t)
 	})
 	t.Run("mixed write paths", testWriteRowsColumnsMixedWritePaths)
+	t.Run("raw rows then typed generic write", testWriteRowsThenGenericWrite)
+	t.Run("raw geospatial level page", testWriteRowsColumnsGeospatialLevelPage)
 	t.Run("large level page", testWriteRowsColumnsLargeLevelPage)
 	t.Run("encrypted level page", testWriteRowsColumnsEncryptedLevelPage)
 }
@@ -358,6 +363,159 @@ func testWriteRowsColumnsMixedWritePaths(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, input) {
 		t.Errorf("round trip mismatch:\n got: %#v\nwant: %#v", got, input)
+	}
+}
+
+func testWriteRowsThenGenericWrite(t *testing.T) {
+	type record struct {
+		Required int32   `parquet:"required"`
+		Optional *int32  `parquet:"optional,optional"`
+		Name     *string `parquet:"name,dict,optional"`
+		Values   []int32 `parquet:"values,list"`
+	}
+
+	first, second := int32(1), int32(2)
+	firstName, secondName := "first", "second"
+	values := make([]int32, 5000)
+	for i := range values {
+		values[i] = first + int32(i)
+	}
+	input := []record{
+		{Required: first, Optional: &first, Name: &firstName, Values: values},
+		{Required: second, Name: &secondName, Values: []int32{}},
+	}
+	schema := parquet.SchemaOf(record{})
+	rows := make([]parquet.Row, len(input))
+	wantValues := make([]int64, len(schema.Columns()))
+	for i := range input {
+		rows[i] = schema.Deconstruct(nil, &input[i])
+		for column, values := range rows[i].Range {
+			wantValues[column] += int64(len(values))
+		}
+	}
+
+	for _, version := range []int{v1, v2} {
+		t.Run(fmt.Sprintf("data-page-v%d", version), func(t *testing.T) {
+			var output bytes.Buffer
+			writer := parquet.NewGenericWriter[record](
+				&output,
+				parquet.DataPageVersion(version),
+				parquet.PageBufferSize(1<<20),
+			)
+			if n, err := writer.WriteRows(rows[:1]); err != nil {
+				t.Fatal(err)
+			} else if n != 1 {
+				t.Fatalf("raw writer wrote %d rows, want 1", n)
+			}
+			if n, err := writer.Write(input[1:]); err != nil {
+				t.Fatal(err)
+			} else if n != 1 {
+				t.Fatalf("generic writer wrote %d rows, want 1", n)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			file, err := parquet.OpenFile(bytes.NewReader(output.Bytes()), int64(output.Len()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := file.NumRows(); got != int64(len(input)) {
+				t.Fatalf("file has %d rows, want %d", got, len(input))
+			}
+			columns := file.RowGroups()[0].ColumnChunks()
+			for i, column := range columns {
+				if got := column.NumValues(); got != wantValues[i] {
+					t.Errorf("column %d has %d values, want %d", i, got, wantValues[i])
+				}
+				pages := column.Pages()
+				var pageCount int
+				var rowsInPages int64
+				for {
+					page, err := pages.ReadPage()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					pageCount++
+					rowsInPages += page.NumRows()
+					parquet.Release(page)
+				}
+				if err := pages.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if rowsInPages != int64(len(input)) {
+					t.Errorf("column %d pages have %d rows, want %d", i, rowsInPages, len(input))
+				}
+				if pageCount != 1 {
+					t.Errorf("column %d has %d pages, want 1", i, pageCount)
+				}
+			}
+
+			reader := parquet.NewGenericReader[record](file)
+			got := make([]record, len(input))
+			if n, err := reader.Read(got); err != nil && !errors.Is(err, io.EOF) {
+				t.Fatal(err)
+			} else if n != len(got) {
+				t.Fatalf("reader returned %d rows, want %d", n, len(got))
+			}
+			if err := reader.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, input) {
+				t.Errorf("round trip mismatch:\n got: %#v\nwant: %#v", got, input)
+			}
+		})
+	}
+}
+
+func testWriteRowsColumnsGeospatialLevelPage(t *testing.T) {
+	type record struct {
+		Geom geom.T `parquet:"geom,optional,geometry(OGC:CRS84)"`
+	}
+
+	input := []record{
+		{Geom: geom.NewPointFlat(geom.XY, []float64{1, 2})},
+		{},
+		{Geom: geom.NewLineStringFlat(geom.XY, []float64{3, 4, 5, 6})},
+	}
+	schema := parquet.SchemaOf(record{})
+	rows := make([]parquet.Row, len(input))
+	for i, record := range input {
+		if record.Geom == nil {
+			rows[i] = parquet.Row{parquet.Value{}.Level(0, 0, 0)}
+			continue
+		}
+		data, err := wkb.Marshal(record.Geom, binary.LittleEndian)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows[i] = parquet.Row{parquet.ValueOf(data).Level(0, 1, 0)}
+	}
+
+	var output bytes.Buffer
+	writer := parquet.NewWriter(&output, schema, parquet.PageBufferSize(1<<20))
+	if n, err := writer.WriteRows(rows); err != nil {
+		t.Fatal(err)
+	} else if n != len(rows) {
+		t.Fatalf("writer wrote %d rows, want %d", n, len(rows))
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := parquet.OpenFile(bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats := file.Metadata().RowGroups[0].Columns[0].MetaData.GeospatialStatistics
+	if stats.BBox.XMin != 1 || stats.BBox.XMax != 5 || stats.BBox.YMin != 2 || stats.BBox.YMax != 6 {
+		t.Errorf("bounding box = [%v %v] x [%v %v], want [1 5] x [2 6]", stats.BBox.XMin, stats.BBox.XMax, stats.BBox.YMin, stats.BBox.YMax)
+	}
+	if !slices.Equal(stats.GeoSpatialTypes, []int32{1, 2}) {
+		t.Errorf("geospatial types = %v, want [1 2]", stats.GeoSpatialTypes)
 	}
 }
 

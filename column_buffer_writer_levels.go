@@ -1,7 +1,9 @@
 package parquet
 
 import (
+	"fmt"
 	"io"
+	"math/bits"
 
 	"github.com/parquet-go/parquet-go/encoding"
 	"github.com/parquet-go/parquet-go/internal/memory"
@@ -91,8 +93,10 @@ func (column *writerLevelsColumnBuffer) Reset() {
 func (column *writerLevelsColumnBuffer) Size() int64 {
 	size := column.ColumnBuffer.Size() + column.numValues
 	if column.maxRepetitionLevel > 0 {
-		return size + column.numValues + 8*column.numRows
+		size += column.numValues
 	}
+	// The raw level lengths conservatively estimate their encoded size. The
+	// per-row allowance covers hybrid RLE headers, not deleted row mappings.
 	return size + 4*column.numRows
 }
 
@@ -122,6 +126,93 @@ func (column *writerLevelsColumnBuffer) WriteValues(values []Value) (int, error)
 		return 0, err
 	}
 	return len(values), nil
+}
+
+// copyTo materializes the raw values required by the generic sparse writer
+// without first emitting a partial page. It is used only when callers change
+// from raw rows to the generic writer within one row group.
+func (column *writerLevelsColumnBuffer) copyTo(dst ColumnBuffer) error {
+	numValues := int(column.numValues)
+	if numValues == 0 {
+		return nil
+	}
+
+	var definitions, repetitions []byte
+	var err error
+	if column.maxDefinitionLevel > 0 {
+		definitions, err = decodeWriterLevels(
+			column.definitions,
+			column.definitionTail.Slice(),
+			column.maxDefinitionLevel,
+		)
+		if err != nil {
+			return fmt.Errorf("decoding definition levels: %w", err)
+		}
+	} else {
+		definitions = make([]byte, numValues)
+	}
+	if len(definitions) != numValues {
+		return fmt.Errorf("decoded %d definition levels for %d values", len(definitions), numValues)
+	}
+	if column.maxRepetitionLevel > 0 {
+		repetitions, err = decodeWriterLevels(
+			column.repetitions,
+			column.repetitionTail.Slice(),
+			column.maxRepetitionLevel,
+		)
+		if err != nil {
+			return fmt.Errorf("decoding repetition levels: %w", err)
+		}
+		if len(repetitions) != numValues {
+			return fmt.Errorf("decoded %d repetition levels for %d values", len(repetitions), numValues)
+		}
+	}
+
+	var page Page
+	if column.maxRepetitionLevel > 0 {
+		page = newRepeatedPage(
+			column.ColumnBuffer.Page(),
+			column.maxRepetitionLevel,
+			column.maxDefinitionLevel,
+			repetitions,
+			definitions,
+		)
+	} else {
+		page = newOptionalPage(column.ColumnBuffer.Page(), column.maxDefinitionLevel, definitions)
+	}
+
+	reader := page.Values()
+	values := make([]Value, writerLevelBufferSize)
+	for {
+		n, err := reader.ReadValues(values)
+		if n > 0 {
+			written, writeErr := dst.WriteValues(values[:n])
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+}
+
+func decodeWriterLevels(encoded, tail []byte, maxLevel byte) ([]byte, error) {
+	bitWidth := bits.Len8(maxLevel)
+	levels, err := levelEncodingsRLE[bitWidth-1].DecodeLevels(nil, encoded)
+	if err != nil {
+		return nil, err
+	}
+	return append(levels, tail...), nil
 }
 
 func (column *writerLevelsColumnBuffer) appendLevels(values []Value) error {

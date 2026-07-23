@@ -202,31 +202,21 @@ func makeWriteFunc[T any](t reflect.Type, writeRows writeRowsFunc) writeFunc[T] 
 	return func(w *GenericWriter[T], rows []T) (n int, err error) {
 		if w.columns == nil {
 			w.columns = make([]ColumnBuffer, len(w.base.writer.currentRowGroup.columns))
-			for i, c := range w.base.writer.currentRowGroup.columns {
-				if _, ok := c.columnBuffer.(*writerLevelsColumnBuffer); ok {
-					if err := c.switchToGenericColumnBuffer(); err != nil {
-						return 0, err
-					}
-				} else {
-					// These fields are usually lazily initialized when writing rows,
-					// we need them to exist now tho.
-					c.columnBuffer = c.newColumnBuffer()
-					// Record the original buffer so the dictionary-encoded buffer is
-					// restored when the row group is flushed after a fallback to PLAIN
-					// switched the column to a different buffer.
-					c.originalColumnBuffer = c.columnBuffer
-				}
-				w.columns[i] = c.columnBuffer
+		}
+
+		// The column buffers may have been created by WriteRows or replaced since
+		// the previous typed write. Preserve existing raw-row data, and materialize
+		// the writer-only level buffer into a generic buffer before sparse writes.
+		for i, c := range w.base.writer.currentRowGroup.columns {
+			if c.columnBuffer == nil {
+				c.columnBuffer = c.newColumnBuffer()
+				// Record the original dictionary-encoding buffer to restore after row group flush
+				// switched the column to a different buffer.
+				c.originalColumnBuffer = c.columnBuffer
+			} else if err := c.switchToGenericColumnBuffer(); err != nil {
+				return 0, err
 			}
-		} else {
-			// The column buffers may have been replaced since the previous call:
-			// when a column's dictionary outgrows DictionaryMaxBytes its buffer is
-			// swapped for a PLAIN-encoded one (fallbackDictionaryToPlain), and
-			// flushing a row group restores the original buffer. Re-resolve the
-			// cached references so rows are not written into abandoned buffers.
-			for i, c := range w.base.writer.currentRowGroup.columns {
-				w.columns[i] = c.columnBuffer
-			}
+			w.columns[i] = c.columnBuffer
 		}
 		writeRows(w.columns, columnLevels{}, makeArrayFromSlice(rows))
 		return len(rows), nil
@@ -2269,32 +2259,24 @@ func (c *ColumnWriter) newColumnBuffer() ColumnBuffer {
 }
 
 func (c *ColumnWriter) newRowColumnBuffer() ColumnBuffer {
-	if c.usesWriterLevelsColumnBuffer() {
+	if c.maxRepetitionLevel > 0 || c.maxDefinitionLevel > 0 {
 		base := c.columnType.NewColumnBuffer(int(c.bufferIndex), 0)
 		return newWriterLevelsColumnBuffer(base, c.maxRepetitionLevel, c.maxDefinitionLevel)
 	}
 	return c.newColumnBuffer()
 }
 
-func (c *ColumnWriter) usesWriterLevelsColumnBuffer() bool {
-	if _, ok := c.columnBuffer.(*writerLevelsColumnBuffer); ok {
-		return true
-	}
-	return c.columnBuffer == nil && c.geospatialAccumulator == nil &&
-		(c.maxRepetitionLevel > 0 || c.maxDefinitionLevel > 0)
-}
-
 func (c *ColumnWriter) switchToGenericColumnBuffer() error {
-	if _, ok := c.columnBuffer.(*writerLevelsColumnBuffer); !ok {
+	column, ok := c.columnBuffer.(*writerLevelsColumnBuffer)
+	if !ok {
 		return nil
 	}
 
 	next := c.newColumnBuffer()
-	if c.columnBuffer.Len() > 0 {
-		if err := c.Flush(); err != nil {
-			return err
-		}
+	if err := column.copyTo(next); err != nil {
+		return err
 	}
+	column.Reset()
 	c.originalColumnBuffer = next
 	if !c.hasSwitchedToPlain {
 		c.columnBuffer = next
