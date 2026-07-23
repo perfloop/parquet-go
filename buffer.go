@@ -391,9 +391,12 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 		return 0, ErrRowGroupSchemaMissing
 	}
 
-	if buf.writeByteArrayRows(rows) {
-		return len(rows), nil
+	numRows := len(rows)
+	numByteArrayRows := buf.writeByteArrayRows(rows)
+	if numByteArrayRows == numRows {
+		return numRows, nil
 	}
+	rows = rows[numByteArrayRows:]
 
 	defer func() {
 		for i, colbuf := range buf.colbuf {
@@ -419,7 +422,7 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 		}
 	}
 
-	return len(rows), nil
+	return numRows, nil
 }
 
 func byteArrayColumnsOf(columns []ColumnBuffer) []*byteArrayColumnBuffer {
@@ -440,32 +443,43 @@ func byteArrayColumnsOf(columns []ColumnBuffer) []*byteArrayColumnBuffer {
 	return byteArrayColumns
 }
 
-func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
+// writeByteArrayRows writes the canonical prefix of rows directly to the
+// byte-array columns and returns the number of rows written.
+func (buf *Buffer) writeByteArrayRows(rows []Row) int {
 	if len(rows) == 0 || len(buf.byteArrayColumns) == 0 {
-		return false
+		return 0
 	}
 
 	numColumns := len(buf.byteArrayColumns)
 	byteArraySizes := buf.byteArraySizes
 	clear(byteArraySizes)
 
+	numRows := 0
+canonicalRows:
 	for _, row := range rows {
 		if len(row) != numColumns {
-			return false
+			break
 		}
 		for columnIndex := range row {
 			value := &row[columnIndex]
 			if value.columnIndex != ^uint16(columnIndex) {
-				return false
+				for i := range columnIndex {
+					byteArraySizes[i] -= int(row[i].u64)
+				}
+				break canonicalRows
 			}
 			byteArraySizes[columnIndex] += int(value.u64)
 		}
+		numRows++
 	}
 
-	for columnIndex, column := range buf.byteArrayColumns {
-		column.writeRows(rows, columnIndex, byteArraySizes[columnIndex])
+	if numRows == 0 {
+		return 0
 	}
-	return true
+	for columnIndex, column := range buf.byteArrayColumns {
+		column.writeRows(rows[:numRows], columnIndex, byteArraySizes[columnIndex])
+	}
+	return numRows
 }
 
 // WriteRowGroup satisfies the RowGroupWriter interface.

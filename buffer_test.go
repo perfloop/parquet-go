@@ -544,6 +544,51 @@ func TestBuffer(t *testing.T) {
 			t.Fatalf("rows after page materialization mismatch:\nwant: %#v\n got: %#v", want, got)
 		}
 	})
+
+	t.Run("canonical byte-array prefix before noncanonical row", func(t *testing.T) {
+		type record struct {
+			First  string
+			Second string
+		}
+
+		want := []record{
+			{First: "first-0", Second: "second-0"},
+			{First: "first-1", Second: "second-1"},
+			{First: "first-2", Second: "second-2"},
+		}
+		schema := parquet.SchemaOf(record{})
+		rows := make([]parquet.Row, len(want))
+		for i := range want {
+			rows[i] = schema.Deconstruct(nil, want[i])
+		}
+		rows[len(rows)-1][0], rows[len(rows)-1][1] = rows[len(rows)-1][1], rows[len(rows)-1][0]
+
+		buffer := parquet.NewBuffer(schema)
+		if n, err := buffer.WriteRows(rows); err != nil || n != len(rows) {
+			t.Fatalf("WriteRows() = %d, %v; want %d, nil", n, err, len(rows))
+		}
+
+		gotRows := make([]parquet.Row, len(want))
+		reader := buffer.Rows()
+		defer reader.Close()
+		n, err := reader.ReadRows(gotRows)
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatal(err)
+		}
+		if n != len(gotRows) {
+			t.Fatalf("ReadRows() = %d; want %d", n, len(gotRows))
+		}
+
+		for i := range gotRows {
+			var got record
+			if err := schema.Reconstruct(&got, gotRows[i]); err != nil {
+				t.Fatalf("Reconstruct(%d): %v", i, err)
+			}
+			if got != want[i] {
+				t.Fatalf("row %d = %#v; want %#v", i, got, want[i])
+			}
+		}
+	})
 }
 
 type sortFunc func(parquet.Type, []parquet.Value)
