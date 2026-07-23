@@ -13,24 +13,25 @@ import (
 // reaches the target number of rows, then written to a temporary row group.
 // When the writer is flushed or closed, the temporary row groups are merged
 // into a row group in the output file, ensuring that rows remain sorted in the
-// final row group.
+// final row group. Required INT64 layouts using the built-in in-memory pool and
+// no compression retain compact run values instead of materializing temporary
+// row groups.
 //
-// Because row groups get encoded and compressed, they hold a lot less memory
-// than if all rows were retained in memory. Sorting then merging rows chunks
-// also tends to be a lot more efficient than sorting all rows in memory as it
-// results in better CPU cache utilization since sorting multi-megabyte arrays
-// causes a lot of cache misses since the data set cannot be held in CPU caches.
+// Encoded and compressed temporary row groups hold a lot less memory than if
+// all rows were retained in memory. Sorting then merging rows chunks also tends
+// to be a lot more efficient than sorting all rows in memory as it results in
+// better CPU cache utilization since sorting multi-megabyte arrays causes a lot
+// of cache misses since the data set cannot be held in CPU caches.
 type SortingWriter[T any] struct {
-	rowbuf               *RowBuffer[T]
-	writer               *GenericWriter[T]
-	output               *GenericWriter[T]
-	buffer               io.ReadWriteSeeker
-	inMemoryRowGroups    []*Buffer
-	useInMemoryInt64Runs bool
-	maxRows              int64
-	numRows              int64
-	sorting              SortingConfig
-	dedupe               dedupe
+	rowbuf            *RowBuffer[T]
+	writer            *GenericWriter[T]
+	output            *GenericWriter[T]
+	buffer            io.ReadWriteSeeker
+	inMemoryInt64Runs *inMemoryInt64Runs
+	maxRows           int64
+	numRows           int64
+	sorting           SortingConfig
+	dedupe            dedupe
 }
 
 // NewSortingWriter constructs a new sorting writer which writes a parquet file
@@ -69,11 +70,13 @@ func NewSortingWriter[T any](output io.Writer, sortRowCount int64, options ...Wr
 		maxRows: sortRowCount,
 		sorting: config.Sorting,
 	}
-	w.useInMemoryInt64Runs = usesInMemoryInt64Runs(
-		w.rowbuf.Schema(),
-		config.Sorting,
-		config.Sorting.SortingBuffers,
-	)
+	if config.Compression == nil {
+		w.inMemoryInt64Runs = newInMemoryInt64Runs(
+			w.rowbuf.Schema(),
+			config.Sorting,
+			config.Sorting.SortingBuffers,
+		)
+	}
 	return w
 }
 
@@ -88,11 +91,9 @@ func (w *SortingWriter[T]) Close() error {
 		return w.output.Close()
 	}
 
-	var rowGroups []RowGroup
-	if w.useInMemoryInt64Runs {
-		rowGroups = make([]RowGroup, len(w.inMemoryRowGroups))
-		for i, rowGroup := range w.inMemoryRowGroups {
-			rowGroups[i] = rowGroup
+	if w.inMemoryInt64Runs != nil {
+		if err := w.inMemoryInt64Runs.writeTo(w.output, w.rowbuf.compare, w.sorting.DropDuplicatedRows); err != nil {
+			return err
 		}
 	} else {
 		if err := w.writer.Close(); err != nil {
@@ -114,26 +115,25 @@ func (w *SortingWriter[T]) Close() error {
 		if err != nil {
 			return err
 		}
-		rowGroups = f.RowGroups()
-	}
 
-	m, err := MergeRowGroups(rowGroups,
-		&RowGroupConfig{
-			Schema:  w.Schema(),
-			Sorting: w.sorting,
-		},
-	)
-	if err != nil {
-		return err
-	}
+		m, err := MergeRowGroups(f.RowGroups(),
+			&RowGroupConfig{
+				Schema:  w.Schema(),
+				Sorting: w.sorting,
+			},
+		)
+		if err != nil {
+			return err
+		}
 
-	// Writing the merged row group (rather than copying its rows) lets the
-	// writer use its chunk-level fast paths when the sorted chunks do not
-	// overlap: verbatim column chunk copies and column-oriented packing toward
-	// MaxRowsPerRowGroup. Overlapping chunks fall back to the row-oriented heap
-	// merge, and the merge itself applies DropDuplicatedRows when configured.
-	if _, err := w.output.WriteRowGroup(m); err != nil {
-		return err
+		// Writing the merged row group (rather than copying its rows) lets the
+		// writer use its chunk-level fast paths when the sorted chunks do not
+		// overlap: verbatim column chunk copies and column-oriented packing toward
+		// MaxRowsPerRowGroup. Overlapping chunks fall back to the row-oriented heap
+		// merge, and the merge itself applies DropDuplicatedRows when configured.
+		if _, err := w.output.WriteRowGroup(m); err != nil {
+			return err
+		}
 	}
 
 	if err := w.output.Flush(); err != nil {
@@ -160,10 +160,9 @@ func (w *SortingWriter[T]) resetSortingBuffer() {
 	w.writer.Reset(io.Discard)
 	w.numRows = 0
 
-	for _, rowGroup := range w.inMemoryRowGroups {
-		rowGroup.Reset()
+	if w.inMemoryInt64Runs != nil {
+		w.inMemoryInt64Runs.reset()
 	}
-	w.inMemoryRowGroups = nil
 
 	if w.buffer != nil {
 		w.sorting.SortingBuffers.PutBuffer(w.buffer)
@@ -171,34 +170,94 @@ func (w *SortingWriter[T]) resetSortingBuffer() {
 	}
 }
 
-// usesInMemoryInt64Runs limits in-memory runs to a fixed-width layout, where
-// retaining the sorted column buffers has predictable memory use.
-func usesInMemoryInt64Runs(schema *Schema, sorting SortingConfig, pool BufferPool) bool {
+// newInMemoryInt64Runs limits the in-memory run store to a fixed-width layout,
+// where copying values into compact run slices has predictable memory use.
+func newInMemoryInt64Runs(schema *Schema, sorting SortingConfig, pool BufferPool) *inMemoryInt64Runs {
 	if _, ok := pool.(*memoryBufferPool); !ok ||
 		len(sorting.SortingColumns) != 1 ||
 		sorting.SortingColumns[0].Descending() {
-		return false
+		return nil
 	}
 
-	sortingColumn, ok := schema.Lookup(sorting.SortingColumns[0].Path()...)
-	if !ok ||
-		sortingColumn.Node.Type().Kind() != Int64 ||
-		sortingColumn.MaxDefinitionLevel != 0 ||
-		sortingColumn.MaxRepetitionLevel != 0 {
-		return false
+	if _, ok := schema.Lookup(sorting.SortingColumns[0].Path()...); !ok {
+		return nil
 	}
 
-	for _, path := range schema.Columns() {
+	columns := schema.Columns()
+	for _, path := range columns {
 		column, ok := schema.Lookup(path...)
 		if !ok ||
 			column.Node.Type().Kind() != Int64 ||
 			column.MaxDefinitionLevel != 0 ||
 			column.MaxRepetitionLevel != 0 {
-			return false
+			return nil
 		}
 	}
 
-	return true
+	return &inMemoryInt64Runs{columns: len(columns)}
+}
+
+type inMemoryInt64Runs struct {
+	columns int
+	runs    []inMemoryInt64Run
+}
+
+type inMemoryInt64Run struct {
+	values []int64
+}
+
+func (r *inMemoryInt64Runs) appendRows(rows []Row) {
+	values := make([]int64, len(rows)*r.columns)
+	for i, row := range rows {
+		for _, value := range row {
+			values[i*r.columns+value.Column()] = value.Int64()
+		}
+	}
+	r.runs = append(r.runs, inMemoryInt64Run{values: values})
+}
+
+func (r *inMemoryInt64Runs) reset() {
+	r.runs = nil
+}
+
+func (r *inMemoryInt64Runs) writeTo(dst RowWriter, compare func(Row, Row) int, dropDuplicatedRows bool) error {
+	readers := make([]RowReader, len(r.runs))
+	for i := range r.runs {
+		readers[i] = &inMemoryInt64RunReader{
+			run:     &r.runs[i],
+			columns: r.columns,
+		}
+	}
+
+	var reader RowReader = MergeRowReaders(readers, compare)
+	if dropDuplicatedRows {
+		reader = DedupeRowReader(reader, compare)
+	}
+	_, err := CopyRows(dst, reader)
+	return err
+}
+
+type inMemoryInt64RunReader struct {
+	run     *inMemoryInt64Run
+	columns int
+	offset  int
+}
+
+func (r *inMemoryInt64RunReader) ReadRows(rows []Row) (int, error) {
+	n := min(len(rows), len(r.run.values)/r.columns-r.offset)
+	for i := range n {
+		values := rows[i][:0]
+		for column := range r.columns {
+			value := r.run.values[(r.offset+i)*r.columns+column]
+			values = append(values, Int64Value(value).Level(0, 0, column))
+		}
+		rows[i] = values
+	}
+	r.offset += n
+	if r.offset == len(r.run.values)/r.columns {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 func (w *SortingWriter[T]) Write(rows []T) (int, error) {
@@ -249,7 +308,6 @@ func (w *SortingWriter[T]) sortAndWriteBufferedRows() error {
 		return nil
 	}
 
-	defer w.rowbuf.Reset()
 	sort.Sort(w.rowbuf)
 
 	if w.sorting.DropDuplicatedRows {
@@ -257,24 +315,19 @@ func (w *SortingWriter[T]) sortAndWriteBufferedRows() error {
 		defer w.dedupe.reset()
 	}
 
-	if w.useInMemoryInt64Runs {
-		if len(w.inMemoryRowGroups) == MaxRowGroups {
+	if w.inMemoryInt64Runs != nil {
+		if len(w.inMemoryInt64Runs.runs) == MaxRowGroups {
+			w.rowbuf.Reset()
 			return ErrTooManyRowGroups
 		}
 
-		rowGroup := NewBuffer(&RowGroupConfig{
-			Schema:  w.Schema(),
-			Sorting: w.sorting,
-		})
-		n, err := rowGroup.WriteRows(w.rowbuf.rows)
-		if err != nil {
-			return err
-		}
-		w.inMemoryRowGroups = append(w.inMemoryRowGroups, rowGroup)
-		w.numRows += int64(n)
+		w.inMemoryInt64Runs.appendRows(w.rowbuf.rows)
+		w.numRows += w.rowbuf.NumRows()
+		w.rowbuf.Reset()
 		return nil
 	}
 
+	defer w.rowbuf.Reset()
 	rows := w.rowbuf.Rows()
 	defer rows.Close()
 
