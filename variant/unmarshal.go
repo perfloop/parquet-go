@@ -14,9 +14,9 @@ func decodeGoValue(m Metadata, data []byte) (any, error) {
 }
 
 type goValueDecoder struct {
-	// strings shares copied repeated values within one result without retaining
-	// the caller's input bytes.
-	strings map[string]string
+	// strings keeps recent copied values without retaining the caller's input
+	// bytes or allocating for every distinct value.
+	strings [3]string
 }
 
 func (d *goValueDecoder) decode(m Metadata, data []byte) (any, error) {
@@ -71,15 +71,19 @@ func (d *goValueDecoder) decodeString(data []byte) (any, error) {
 }
 
 func (d *goValueDecoder) internString(data []byte) string {
-	if cached, ok := d.strings[string(data)]; ok {
-		return cached
+	for i, cached := range d.strings {
+		if len(cached) == len(data) && cached == string(data) {
+			if i > 0 {
+				copy(d.strings[1:i+1], d.strings[:i])
+				d.strings[0] = cached
+			}
+			return cached
+		}
 	}
 
 	s := string(data)
-	if d.strings == nil {
-		d.strings = make(map[string]string)
-	}
-	d.strings[s] = s
+	copy(d.strings[1:], d.strings[:len(d.strings)-1])
+	d.strings[0] = s
 	return s
 }
 
