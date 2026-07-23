@@ -15,11 +15,50 @@ const (
 type pageRangeMergeRow struct {
 	Key    int64 `parquet:"key"`
 	Source int32 `parquet:"source"`
+	Value0 int64 `parquet:"value0"`
+	Value1 int64 `parquet:"value1"`
+	Value2 int64 `parquet:"value2"`
+	Value3 int64 `parquet:"value3"`
+	Value4 int64 `parquet:"value4"`
+	Value5 int64 `parquet:"value5"`
+	Value6 int64 `parquet:"value6"`
+	Value7 int64 `parquet:"value7"`
+}
+
+func makePageRangeMergeRow(key int64, source int32) pageRangeMergeRow {
+	return pageRangeMergeRow{
+		Key:    key,
+		Source: source,
+		Value0: key*3 + int64(source),
+		Value1: key*5 + int64(source),
+		Value2: key*7 + int64(source),
+		Value3: key*11 + int64(source),
+		Value4: key*13 + int64(source),
+		Value5: key*17 + int64(source),
+		Value6: key*19 + int64(source),
+		Value7: key*23 + int64(source),
+	}
 }
 
 type pageRangeMergeFixture struct {
 	rowGroups []RowGroup
 	options   []RowGroupOption
+}
+
+// noPageIndexRowGroup creates the absent-metadata control for the range-plan
+// fixture while preserving its source rows and sorting metadata.
+type noPageIndexRowGroup struct{ RowGroup }
+
+func (g noPageIndexRowGroup) ColumnChunks() []ColumnChunk {
+	chunks := append([]ColumnChunk(nil), g.RowGroup.ColumnChunks()...)
+	chunks[0] = noPageIndexColumnChunk{ColumnChunk: chunks[0]}
+	return chunks
+}
+
+type noPageIndexColumnChunk struct{ ColumnChunk }
+
+func (noPageIndexColumnChunk) ColumnIndex() (ColumnIndex, error) {
+	return nil, ErrMissingColumnIndex
 }
 
 func newPageRangeMergeFixture(tb testing.TB) pageRangeMergeFixture {
@@ -49,15 +88,13 @@ func newPageRangeMergeRowGroup(tb testing.TB, start int, source int32) RowGroup 
 	var data bytes.Buffer
 	writer := NewGenericWriter[pageRangeMergeRow](
 		&data,
-		PageBufferSize(1024),
+		PageBufferSize(8*1024),
 		ColumnIndexSizeLimit(func([]string) int { return 1 << 20 }),
 		SortingWriterConfig(SortingColumns(Ascending("key"))),
 	)
 	for i := range pageRangeMergeRows {
-		if _, err := writer.Write([]pageRangeMergeRow{{
-			Key:    int64(start + i),
-			Source: source,
-		}}); err != nil {
+		row := makePageRangeMergeRow(int64(start+i), source)
+		if _, err := writer.Write([]pageRangeMergeRow{row}); err != nil {
 			tb.Fatalf("write row %d: %v", i, err)
 		}
 	}
@@ -116,18 +153,12 @@ func (f pageRangeMergeFixture) expectedRow(rowIndex int) pageRangeMergeRow {
 
 	switch {
 	case rowIndex < prefix:
-		return pageRangeMergeRow{Key: int64(rowIndex), Source: 0}
+		return makePageRangeMergeRow(int64(rowIndex), 0)
 	case rowIndex < prefix+2*pageRangeMergeOverlap:
 		overlapIndex := rowIndex - prefix
-		return pageRangeMergeRow{
-			Key:    int64(prefix + overlapIndex/2),
-			Source: int32(overlapIndex % 2),
-		}
+		return makePageRangeMergeRow(int64(prefix+overlapIndex/2), int32(overlapIndex%2))
 	default:
-		return pageRangeMergeRow{
-			Key:    int64(pageRangeMergeRows + rowIndex - (prefix + 2*pageRangeMergeOverlap)),
-			Source: 1,
-		}
+		return makePageRangeMergeRow(int64(pageRangeMergeRows+rowIndex-(prefix+2*pageRangeMergeOverlap)), 1)
 	}
 }
 
@@ -156,15 +187,24 @@ func (f pageRangeMergeFixture) checkRows(tb testing.TB, merged RowGroup) {
 	for {
 		n, err := rows.ReadRows(buffer)
 		for _, row := range buffer[:n] {
-			if len(row) != 2 {
-				tb.Fatalf("row %d has %d values, want 2", rowIndex, len(row))
+			if len(row) != 10 {
+				tb.Fatalf("row %d has %d values, want 10", rowIndex, len(row))
 			}
 			want := f.expectedRow(rowIndex)
-			if got := row[0].Int64(); got != want.Key {
-				tb.Fatalf("row %d key: got %d, want %d", rowIndex, got, want.Key)
+			got := pageRangeMergeRow{
+				Key:    row[0].Int64(),
+				Source: row[1].Int32(),
+				Value0: row[2].Int64(),
+				Value1: row[3].Int64(),
+				Value2: row[4].Int64(),
+				Value3: row[5].Int64(),
+				Value4: row[6].Int64(),
+				Value5: row[7].Int64(),
+				Value6: row[8].Int64(),
+				Value7: row[9].Int64(),
 			}
-			if got := row[1].Int32(); got != want.Source {
-				tb.Fatalf("row %d source: got %d, want %d", rowIndex, got, want.Source)
+			if got != want {
+				tb.Fatalf("row %d: got %+v, want %+v", rowIndex, got, want)
 			}
 			rowIndex++
 		}
@@ -186,6 +226,16 @@ func TestMergeRowGroupsPageIndexedBoundaryOverlap(t *testing.T) {
 
 	t.Run("preserves_order_and_tie_order", func(t *testing.T) {
 		merged := fixture.merge(t, fixture.options)
+		fixture.checkRows(t, merged)
+	})
+
+	t.Run("falls_back_without_leading_page_index", func(t *testing.T) {
+		rowGroups := append([]RowGroup(nil), fixture.rowGroups...)
+		rowGroups[0] = noPageIndexRowGroup{RowGroup: rowGroups[0]}
+		merged, err := MergeRowGroups(rowGroups, fixture.options...)
+		if err != nil {
+			t.Fatal(err)
+		}
 		fixture.checkRows(t, merged)
 	})
 
