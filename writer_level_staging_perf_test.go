@@ -124,7 +124,7 @@ func TestWriterWriteRowsLevelStagingRoundTrip(t *testing.T) {
 			rowIndex := 0
 			for {
 				n, err := reader.ReadRows(readBuffer)
-				for i := 0; i < n; i++ {
+				for i := range n {
 					if !reflect.DeepEqual(readBuffer[i], rows[rowIndex+i]) {
 						t.Fatalf("decoded raw row %d differs from the row supplied to WriteRows", rowIndex+i)
 					}
