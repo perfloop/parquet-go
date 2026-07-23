@@ -182,6 +182,7 @@ func AsyncRowGroup(base RowGroup) RowGroup {
 }
 
 type rowGroupRows struct {
+	rowGroup RowGroup
 	schema   *Schema
 	bufsize  int
 	buffers  []Value
@@ -189,6 +190,15 @@ type rowGroupRows struct {
 	closed   bool
 	rowIndex int64
 }
+
+// rowReaderNoWriterTo preserves the schema handshake while preventing the
+// fallback in rowGroupRows.WriteRowsTo from selecting the same fast path again.
+type rowReaderNoWriterTo struct {
+	RowReader
+	schema *Schema
+}
+
+func (r rowReaderNoWriterTo) Schema() *Schema { return r.schema }
 
 type columnChunkRows struct {
 	offset int32
@@ -204,7 +214,9 @@ func (r *rowGroupRows) buffer(i int) []Value {
 
 // / NewRowGroupRowReader constructs a new row reader for the given row group.
 func NewRowGroupRowReader(rowGroup RowGroup) Rows {
-	return newRowGroupRows(rowGroup.Schema(), rowGroup.ColumnChunks(), defaultValueBufferSize)
+	rows := newRowGroupRows(rowGroup.Schema(), rowGroup.ColumnChunks(), defaultValueBufferSize)
+	rows.rowGroup = rowGroup
+	return rows
 }
 
 func newRowGroupRows(schema *Schema, columns []ColumnChunk, bufferSize int) *rowGroupRows {
@@ -276,6 +288,25 @@ func (r *rowGroupRows) SeekToRow(rowIndex int64) error {
 		r.rowIndex = rowIndex
 	}
 	return nil
+}
+
+func (r *rowGroupRows) WriteRowsTo(w RowWriter) (int64, error) {
+	if !r.closed && r.rowIndex < 0 && chunkTransparentRowGroup(r.rowGroup) {
+		if w, ok := w.(RowGroupWriter); ok {
+			// A destination may split this source row group, but CopyRows must
+			// report all source rows consumed rather than the final output group.
+			numRows := r.rowGroup.NumRows()
+			n, err := w.WriteRowGroup(r.rowGroup)
+			if err != nil {
+				return n, err
+			}
+			if err := r.SeekToRow(numRows); err != nil {
+				return n, err
+			}
+			return numRows, nil
+		}
+	}
+	return copyRows(w, rowReaderNoWriterTo{RowReader: r, schema: r.schema}, nil)
 }
 
 func (r *rowGroupRows) ReadRows(rows []Row) (int, error) {
@@ -486,7 +517,7 @@ func (emptyPages) Close() error            { return nil }
 
 var (
 	_ RowReaderWithSchema = (*rowGroupRows)(nil)
-	//_ RowWriterTo         = (*rowGroupRows)(nil)
+	_ RowWriterTo         = (*rowGroupRows)(nil)
 
 	_ RowReaderWithSchema = emptyRows{}
 	_ RowWriterTo         = emptyRows{}
