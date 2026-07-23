@@ -23,7 +23,7 @@ type writerLevelStagingHistogram struct {
 	repetitions []int64
 }
 
-func makeWriterLevelStagingInput(numRows int) (*parquet.Schema, []writerLevelStagingRecord, []parquet.Row) {
+func makeWriterLevelStagingInput(numRows int) (*parquet.Schema, []parquet.Row) {
 	schema := parquet.SchemaOf(writerLevelStagingRecord{})
 	records := make([]writerLevelStagingRecord, numRows)
 	rows := make([]parquet.Row, numRows)
@@ -60,7 +60,7 @@ func makeWriterLevelStagingInput(numRows int) (*parquet.Schema, []writerLevelSta
 		rows[i] = schema.Deconstruct(nil, &records[i])
 	}
 
-	return schema, records, rows
+	return schema, rows
 }
 
 func writerLevelStagingHistograms(rows []parquet.Row) []writerLevelStagingHistogram {
@@ -88,7 +88,7 @@ func incrementWriterLevelStagingHistogram(histogram []int64, level int) []int64 
 }
 
 func TestWriterWriteRowsLevelStagingRoundTrip(t *testing.T) {
-	schema, want, rows := makeWriterLevelStagingInput(writerLevelStagingRowCount)
+	schema, rows := makeWriterLevelStagingInput(writerLevelStagingRowCount)
 	histograms := writerLevelStagingHistograms(rows)
 
 	for _, version := range []int{1, 2} {
@@ -115,16 +115,21 @@ func TestWriterWriteRowsLevelStagingRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := file.NumRows(); got != int64(len(want)) {
-				t.Fatalf("file has %d rows, want %d", got, len(want))
+			if got := file.NumRows(); got != int64(len(rows)) {
+				t.Fatalf("file has %d rows, want %d", got, len(rows))
 			}
 
-			reader := parquet.NewGenericReader[writerLevelStagingRecord](file)
-			got := make([]writerLevelStagingRecord, 0, len(want))
-			readBuffer := make([]writerLevelStagingRecord, 127)
+			reader := parquet.NewReader(file)
+			readBuffer := make([]parquet.Row, 127)
+			rowIndex := 0
 			for {
-				n, err := reader.Read(readBuffer)
-				got = append(got, readBuffer[:n]...)
+				n, err := reader.ReadRows(readBuffer)
+				for i := 0; i < n; i++ {
+					if !reflect.DeepEqual(readBuffer[i], rows[rowIndex+i]) {
+						t.Fatalf("decoded raw row %d differs from the row supplied to WriteRows", rowIndex+i)
+					}
+				}
+				rowIndex += n
 				if err == io.EOF {
 					break
 				}
@@ -135,12 +140,12 @@ func TestWriterWriteRowsLevelStagingRoundTrip(t *testing.T) {
 			if err := reader.Close(); err != nil {
 				t.Fatal(err)
 			}
-			if !reflect.DeepEqual(got, want) {
-				t.Fatal("decoded rows differ from rows supplied to WriteRows")
+			if rowIndex != len(rows) {
+				t.Fatalf("reader returned %d rows, want %d", rowIndex, len(rows))
 			}
 
 			assertWriterLevelStagingMetadata(t, file, histograms)
-			assertWriterLevelStagingPages(t, file, histograms, len(want))
+			assertWriterLevelStagingPages(t, file, histograms, len(rows))
 		})
 	}
 }
@@ -210,7 +215,7 @@ func assertWriterLevelStagingPages(t *testing.T, file *parquet.File, histograms 
 }
 
 func BenchmarkWriterWriteRowsLevelStaging(b *testing.B) {
-	schema, _, rows := makeWriterLevelStagingInput(writerLevelStagingRowCount)
+	schema, rows := makeWriterLevelStagingInput(writerLevelStagingRowCount)
 	offset := 0
 
 	b.ReportAllocs()
