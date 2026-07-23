@@ -25,9 +25,11 @@ import (
 // of cache misses since the data set cannot be held in CPU caches.
 type SortingWriter[T any] struct {
 	rowbuf            *RowBuffer[T]
+	config            *WriterConfig
 	writer            *GenericWriter[T] // temporary-run fallback only
 	output            *GenericWriter[T]
 	buffer            io.ReadWriteSeeker
+	compactInt64Runs  bool
 	inMemoryInt64Runs *inMemoryInt64Runs
 	maxRows           int64
 	numRows           int64
@@ -55,6 +57,7 @@ func NewSortingWriter[T any](output io.Writer, sortRowCount int64, options ...Wr
 			Schema:  config.Schema,
 			Sorting: config.Sorting,
 		}),
+		config:  config,
 		output:  NewGenericWriter[T](output, config),
 		maxRows: sortRowCount,
 		sorting: config.Sorting,
@@ -65,20 +68,10 @@ func NewSortingWriter[T any](output io.Writer, sortRowCount int64, options ...Wr
 			config.Sorting,
 			config.Sorting.SortingBuffers,
 		)
+		w.compactInt64Runs = w.inMemoryInt64Runs != nil
 	}
 	if w.inMemoryInt64Runs == nil {
-		w.writer = NewGenericWriter[T](io.Discard, &WriterConfig{
-			CreatedBy:            config.CreatedBy,
-			ColumnPageBuffers:    config.ColumnPageBuffers,
-			ColumnIndexSizeLimit: config.ColumnIndexSizeLimit,
-			PageBufferSize:       config.PageBufferSize,
-			WriteBufferSize:      config.WriteBufferSize,
-			DataPageVersion:      config.DataPageVersion,
-			Schema:               config.Schema,
-			Compression:          config.Compression,
-			Sorting:              config.Sorting,
-			Encodings:            config.Encodings,
-		})
+		w.writer = w.temporaryWriter()
 	}
 	return w
 }
@@ -159,6 +152,44 @@ func (w *SortingWriter[T]) Reset(output io.Writer) {
 	w.resetSortingBuffer()
 }
 
+func (w *SortingWriter[T]) temporaryWriter() *GenericWriter[T] {
+	if w.writer == nil {
+		config := w.config
+		w.writer = NewGenericWriter[T](io.Discard, &WriterConfig{
+			CreatedBy:            config.CreatedBy,
+			ColumnPageBuffers:    config.ColumnPageBuffers,
+			ColumnIndexSizeLimit: config.ColumnIndexSizeLimit,
+			PageBufferSize:       config.PageBufferSize,
+			WriteBufferSize:      config.WriteBufferSize,
+			DataPageVersion:      config.DataPageVersion,
+			Schema:               config.Schema,
+			Compression:          config.Compression,
+			Sorting:              config.Sorting,
+			Encodings:            config.Encodings,
+		})
+	}
+	return w.writer
+}
+
+func (w *SortingWriter[T]) materializeInMemoryInt64Runs() error {
+	runs := w.inMemoryInt64Runs
+	if runs == nil {
+		return nil
+	}
+
+	writer := w.temporaryWriter()
+	if w.buffer == nil {
+		w.buffer = w.sorting.SortingBuffers.GetBuffer()
+		writer.Reset(w.buffer)
+	}
+	if err := runs.writeToTemporary(writer); err != nil {
+		return err
+	}
+	runs.reset()
+	w.inMemoryInt64Runs = nil
+	return nil
+}
+
 func (w *SortingWriter[T]) resetSortingBuffer() {
 	if w.writer != nil {
 		w.writer.Reset(io.Discard)
@@ -167,6 +198,12 @@ func (w *SortingWriter[T]) resetSortingBuffer() {
 
 	if w.inMemoryInt64Runs != nil {
 		w.inMemoryInt64Runs.reset()
+	} else if w.compactInt64Runs {
+		w.inMemoryInt64Runs = newInMemoryInt64Runs(
+			w.rowbuf.Schema(),
+			w.sorting,
+			w.sorting.SortingBuffers,
+		)
 	}
 
 	if w.buffer != nil {
@@ -175,8 +212,13 @@ func (w *SortingWriter[T]) resetSortingBuffer() {
 	}
 }
 
+// maxInMemoryInt64RunBytes bounds raw values retained before the writer
+// materializes subsequent runs through its existing temporary-run path.
+const maxInMemoryInt64RunBytes = 8 << 20
+
 // newInMemoryInt64Runs limits the in-memory run store to a fixed-width layout,
-// where copying values into compact run slices has predictable memory use.
+// where copying values into compact run slices has predictable, bounded memory
+// use.
 func newInMemoryInt64Runs(schema *Schema, sorting SortingConfig, pool BufferPool) *inMemoryInt64Runs {
 	if _, ok := pool.(*memoryBufferPool); !ok ||
 		len(sorting.SortingColumns) != 1 ||
@@ -184,14 +226,19 @@ func newInMemoryInt64Runs(schema *Schema, sorting SortingConfig, pool BufferPool
 		return nil
 	}
 
-	if _, ok := schema.Lookup(sorting.SortingColumns[0].Path()...); !ok {
+	key, ok := schema.Lookup(sorting.SortingColumns[0].Path()...)
+	if !ok {
 		return nil
 	}
 
 	columns := schema.Columns()
+	if len(columns) == 0 {
+		return nil
+	}
 	for _, path := range columns {
 		column, ok := schema.Lookup(path...)
 		if !ok ||
+			column.Node.Compression() != nil ||
 			column.Node.Type().Kind() != Int64 ||
 			column.MaxDefinitionLevel != 0 ||
 			column.MaxRepetitionLevel != 0 {
@@ -199,14 +246,21 @@ func newInMemoryInt64Runs(schema *Schema, sorting SortingConfig, pool BufferPool
 		}
 	}
 
-	return &inMemoryInt64Runs{columns: len(columns)}
+	return &inMemoryInt64Runs{
+		columns:   len(columns),
+		keyColumn: key.ColumnIndex,
+	}
 }
 
 var errInvalidInMemoryInt64Row = errors.New("invalid row for in-memory INT64 sorting run")
 
 type inMemoryInt64Runs struct {
-	columns int
-	runs    [][]int64
+	columns   int
+	keyColumn int
+	runs      [][]int64
+	bytes     int64
+	maxKey    int64
+	hasMaxKey bool
 }
 
 func (r *inMemoryInt64Runs) validateRows(rows []Row) error {
@@ -226,6 +280,18 @@ func (r *inMemoryInt64Runs) validateRows(rows []Row) error {
 	return nil
 }
 
+func (r *inMemoryInt64Runs) shouldMaterialize(rows []Row) bool {
+	// A one-row key range can be disjoint before later runs overlap, so only the
+	// retained-byte bound moves one-row streams to the materialized path.
+	if len(rows) > 1 && r.hasMaxKey && rows[0][r.keyColumn].Int64() > r.maxKey {
+		return true
+	}
+	if r.bytes == maxInMemoryInt64RunBytes {
+		return true
+	}
+	return int64(len(rows)) > (maxInMemoryInt64RunBytes-r.bytes)/(int64(r.columns)*8)
+}
+
 func (r *inMemoryInt64Runs) appendRows(rows []Row) {
 	values := make([]int64, len(rows)*r.columns)
 	// validateRows establishes positional identity before sorting, which keeps
@@ -236,10 +302,39 @@ func (r *inMemoryInt64Runs) appendRows(rows []Row) {
 		}
 	}
 	r.runs = append(r.runs, values)
+	r.bytes += int64(len(values)) * 8
+	maxKey := rows[len(rows)-1][r.keyColumn].Int64()
+	if !r.hasMaxKey || maxKey > r.maxKey {
+		r.maxKey = maxKey
+		r.hasMaxKey = true
+	}
 }
 
 func (r *inMemoryInt64Runs) reset() {
 	r.runs = nil
+	r.bytes = 0
+	r.hasMaxKey = false
+}
+
+type rowWriterFlusher interface {
+	RowWriter
+	Flush() error
+}
+
+func (r *inMemoryInt64Runs) writeToTemporary(dst rowWriterFlusher) error {
+	for i := range r.runs {
+		reader := inMemoryInt64RunReader{
+			values:  r.runs[i],
+			columns: r.columns,
+		}
+		if _, err := CopyRows(dst, &reader); err != nil {
+			return err
+		}
+		if err := dst.Flush(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *inMemoryInt64Runs) writeTo(dst RowWriter, compare func(Row, Row) int, dropDuplicatedRows bool) error {
@@ -347,11 +442,16 @@ func (w *SortingWriter[T]) sortAndWriteBufferedRows() error {
 			w.rowbuf.Reset()
 			return ErrTooManyRowGroups
 		}
-
-		w.inMemoryInt64Runs.appendRows(w.rowbuf.rows)
-		w.numRows += w.rowbuf.NumRows()
-		w.rowbuf.Reset()
-		return nil
+		if w.inMemoryInt64Runs.shouldMaterialize(w.rowbuf.rows) {
+			if err := w.materializeInMemoryInt64Runs(); err != nil {
+				return err
+			}
+		} else {
+			w.inMemoryInt64Runs.appendRows(w.rowbuf.rows)
+			w.numRows += w.rowbuf.NumRows()
+			w.rowbuf.Reset()
+			return nil
+		}
 	}
 
 	defer w.rowbuf.Reset()
@@ -360,7 +460,7 @@ func (w *SortingWriter[T]) sortAndWriteBufferedRows() error {
 
 	if w.buffer == nil {
 		w.buffer = w.sorting.SortingBuffers.GetBuffer()
-		w.writer.Reset(w.buffer)
+		w.temporaryWriter().Reset(w.buffer)
 	}
 
 	n, err := CopyRows(w.writer, rows)

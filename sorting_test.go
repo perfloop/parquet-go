@@ -104,6 +104,51 @@ func TestSortingWriterInt64WriteRows(t *testing.T) {
 	assertRowsEqual(t, want, got)
 }
 
+func TestSortingWriterInt64ResetAfterNonOverlappingRuns(t *testing.T) {
+	type Row struct {
+		Payload int64 `parquet:"payload"`
+		Key     int64 `parquet:"key"`
+	}
+
+	var discarded, output bytes.Buffer
+	writer := parquet.NewSortingWriter[Row](&discarded, 2,
+		parquet.SortingWriterConfig(
+			parquet.SortingColumns(parquet.Ascending("key")),
+		),
+	)
+	first := []Row{
+		{Payload: 1, Key: 0}, {Payload: 2, Key: 1},
+		{Payload: 3, Key: 2}, {Payload: 4, Key: 3},
+		{Payload: 5, Key: 4}, {Payload: 6, Key: 5},
+	}
+	if _, err := writer.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	writer.Reset(&output)
+	second := []Row{
+		{Payload: 101, Key: 3}, {Payload: 7, Key: 1},
+		{Payload: 99, Key: 2}, {Payload: 42, Key: 0},
+	}
+	if _, err := writer.Write(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := parquet.Read[Row](bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := slices.Clone(second)
+	slices.SortFunc(want, func(a, b Row) int { return cmp.Compare(a.Key, b.Key) })
+	assertRowsEqual(t, want, got)
+}
+
 func TestSortingWriterInt64WriteRowsRejectsInvalidColumns(t *testing.T) {
 	type Row struct {
 		Payload int64 `parquet:"payload"`
