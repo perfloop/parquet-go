@@ -152,6 +152,7 @@ func BenchmarkWriterFlushStreamingBloomFilter(b *testing.B) {
 		if err := writer.Close(); err != nil {
 			b.Fatal(err)
 		}
+		b.StartTimer()
 	}
 }
 
@@ -177,5 +178,6 @@ func BenchmarkWriterWriteRowsStreamingBloomFilter(b *testing.B) {
 		if output.Len() == 0 {
 			b.Fatal("close did not write the parquet file")
 		}
+		b.StartTimer()
 	}
 }
