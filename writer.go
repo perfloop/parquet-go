@@ -973,25 +973,13 @@ func (rg *ConcurrentRowGroupWriter) WriteRows(rows []Row) (int, error) {
 		// we are preventing further use as well?
 		for _, row := range rows[start:end] {
 			for columnIndex, columnValues := range row.Range {
-				column := rg.columns[columnIndex]
-				if column.usesWriterLevelsColumnBuffer() {
-					if err := column.appendWriterLevelValues(columnValues); err != nil {
-						return 0, err
-					}
-					continue
-				}
 				rg.values[columnIndex] = append(rg.values[columnIndex], columnValues...)
 			}
 		}
 
 		for i, values := range rg.values {
-			column := rg.columns[i]
 			if len(values) > 0 {
-				if _, err := column.WriteRowValues(values); err != nil {
-					return 0, err
-				}
-			} else if column.usesWriterLevelsColumnBuffer() && column.columnBuffer != nil {
-				if err := column.flushWriterLevelBuffer(); err != nil {
+				if _, err := rg.columns[i].WriteRowValues(values); err != nil {
 					return 0, err
 				}
 			}
@@ -2294,24 +2282,6 @@ func (c *ColumnWriter) usesWriterLevelsColumnBuffer() bool {
 	}
 	return c.columnBuffer == nil && c.geospatialAccumulator == nil &&
 		(c.maxRepetitionLevel > 0 || c.maxDefinitionLevel > 0)
-}
-
-// appendWriterLevelValues accepts one raw row without materializing a
-// row-group-sized column slice. Its caller decides when to check the page size.
-func (c *ColumnWriter) appendWriterLevelValues(values []Value) error {
-	if c.columnBuffer == nil {
-		c.columnBuffer = c.newRowColumnBuffer()
-		c.originalColumnBuffer = c.columnBuffer
-	}
-	_, err := c.columnBuffer.WriteValues(values)
-	return err
-}
-
-func (c *ColumnWriter) flushWriterLevelBuffer() error {
-	if c.columnBuffer.Size() >= int64(c.bufferSize) {
-		return c.Flush()
-	}
-	return nil
 }
 
 func (c *ColumnWriter) switchToGenericColumnBuffer() error {

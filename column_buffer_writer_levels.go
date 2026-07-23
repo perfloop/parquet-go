@@ -125,24 +125,48 @@ func (column *writerLevelsColumnBuffer) WriteValues(values []Value) (int, error)
 }
 
 func (column *writerLevelsColumnBuffer) appendLevels(values []Value) error {
-	for _, value := range values {
+	for len(values) > 0 {
+		n := len(values)
 		if column.maxDefinitionLevel > 0 {
-			column.definitionHistogram[value.definitionLevel]++
-			column.definitionTail.Append(value.definitionLevel)
-		}
-		if value.definitionLevel != column.maxDefinitionLevel {
-			column.numNulls++
+			n = min(n, writerLevelBufferSize-column.definitionTail.Len())
 		}
 		if column.maxRepetitionLevel > 0 {
-			column.repetitionHistogram[value.repetitionLevel]++
-			column.repetitionTail.Append(value.repetitionLevel)
-			if value.repetitionLevel == 0 {
-				column.numRows++
-			}
-		} else {
-			column.numRows++
+			n = min(n, writerLevelBufferSize-column.repetitionTail.Len())
 		}
-		column.numValues++
+
+		var definitions, repetitions []byte
+		if column.maxDefinitionLevel > 0 {
+			i := column.definitionTail.Len()
+			column.definitionTail.Resize(i + n)
+			definitions = column.definitionTail.Slice()[i:]
+		}
+		if column.maxRepetitionLevel > 0 {
+			i := column.repetitionTail.Len()
+			column.repetitionTail.Resize(i + n)
+			repetitions = column.repetitionTail.Slice()[i:]
+		}
+
+		for i, value := range values[:n] {
+			if definitions != nil {
+				definitions[i] = value.definitionLevel
+			}
+			if repetitions != nil {
+				repetitions[i] = value.repetitionLevel
+			}
+		}
+
+		column.numValues += int64(n)
+		if definitions != nil {
+			accumulateLevelHistogram(column.definitionHistogram, definitions)
+			column.numNulls += int64(n - countLevelsEqual(definitions, column.maxDefinitionLevel))
+		}
+		if repetitions != nil {
+			accumulateLevelHistogram(column.repetitionHistogram, repetitions)
+			column.numRows += int64(countLevelsEqual(repetitions, 0))
+		} else {
+			column.numRows += int64(n)
+		}
+		values = values[n:]
 
 		if column.repetitionTail.Len() == writerLevelBufferSize {
 			if err := column.flushRepetitionTail(); err != nil {
