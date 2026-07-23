@@ -205,16 +205,14 @@ func makeWriteFunc[T any](t reflect.Type, writeRows writeRowsFunc) writeFunc[T] 
 		}
 
 		// The column buffers may have been created by WriteRows or replaced since
-		// the previous typed write. Preserve existing raw-row data, and materialize
-		// the writer-only level buffer into a generic buffer before sparse writes.
+		// the previous typed write. Preserve existing raw-row data; level buffers
+		// also implement the sparse write methods used below.
 		for i, c := range w.base.writer.currentRowGroup.columns {
 			if c.columnBuffer == nil {
 				c.columnBuffer = c.newColumnBuffer()
 				// Record the original dictionary-encoding buffer to restore after row group flush
 				// switched the column to a different buffer.
 				c.originalColumnBuffer = c.columnBuffer
-			} else if err := c.switchToGenericColumnBuffer(); err != nil {
-				return 0, err
 			}
 			w.columns[i] = c.columnBuffer
 		}
@@ -2266,24 +2264,6 @@ func (c *ColumnWriter) newRowColumnBuffer() ColumnBuffer {
 	return c.newColumnBuffer()
 }
 
-func (c *ColumnWriter) switchToGenericColumnBuffer() error {
-	column, ok := c.columnBuffer.(*writerLevelsColumnBuffer)
-	if !ok {
-		return nil
-	}
-
-	next := c.newColumnBuffer()
-	if err := column.copyTo(next); err != nil {
-		return err
-	}
-	column.Reset()
-	c.originalColumnBuffer = next
-	if !c.hasSwitchedToPlain {
-		c.columnBuffer = next
-	}
-	return nil
-}
-
 // WriteRowValues writes entire rows to the column. On success, this returns the
 // number of rows written (not the number of values).
 //
@@ -2332,8 +2312,6 @@ func (c *ColumnWriter) writeValues(values []Value) (numValues int, err error) {
 		if c.originalColumnBuffer == nil {
 			c.originalColumnBuffer = c.columnBuffer
 		}
-	} else if err := c.switchToGenericColumnBuffer(); err != nil {
-		return 0, err
 	}
 	return c.columnBuffer.WriteValues(values)
 }

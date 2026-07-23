@@ -1,12 +1,12 @@
 package parquet
 
 import (
-	"fmt"
 	"io"
-	"math/bits"
 
+	"github.com/parquet-go/parquet-go/deprecated"
 	"github.com/parquet-go/parquet-go/encoding"
 	"github.com/parquet-go/parquet-go/internal/memory"
+	"github.com/parquet-go/parquet-go/sparse"
 )
 
 const writerLevelBufferSize = 4096
@@ -17,9 +17,9 @@ const writerLevelBufferSize = 4096
 // byte per logical level until the page is flushed. The short tail remains raw
 // so its hybrid encoding can span arbitrary WriteRowValues calls.
 //
-// ColumnWriter uses this adapter only for raw row-writing paths. Callers that
-// start using the generic sparse writer are switched back to the regular
-// optional or repeated buffers before they write more values.
+// Both raw row-writing and the generic sparse writer append through this
+// adapter, so a writer can change APIs without flushing or replaying a partial
+// page.
 type writerLevelsColumnBuffer struct {
 	ColumnBuffer
 
@@ -128,91 +128,116 @@ func (column *writerLevelsColumnBuffer) WriteValues(values []Value) (int, error)
 	return len(values), nil
 }
 
-// copyTo materializes the raw values required by the generic sparse writer
-// without first emitting a partial page. It is used only when callers change
-// from raw rows to the generic writer within one row group.
-func (column *writerLevelsColumnBuffer) copyTo(dst ColumnBuffer) error {
-	numValues := int(column.numValues)
-	if numValues == 0 {
-		return nil
+func (column *writerLevelsColumnBuffer) writeValues(levels columnLevels, rows sparse.Array) {
+	if rows.Len() > 0 && levels.definitionLevel == column.maxDefinitionLevel {
+		column.ColumnBuffer.writeValues(levels, rows)
 	}
-
-	var definitions, repetitions []byte
-	var err error
-	if column.maxDefinitionLevel > 0 {
-		definitions, err = decodeWriterLevels(
-			column.definitions,
-			column.definitionTail.Slice(),
-			column.maxDefinitionLevel,
-		)
-		if err != nil {
-			return fmt.Errorf("decoding definition levels: %w", err)
-		}
-	} else {
-		definitions = make([]byte, numValues)
-	}
-	if len(definitions) != numValues {
-		return fmt.Errorf("decoded %d definition levels for %d values", len(definitions), numValues)
-	}
-	if column.maxRepetitionLevel > 0 {
-		repetitions, err = decodeWriterLevels(
-			column.repetitions,
-			column.repetitionTail.Slice(),
-			column.maxRepetitionLevel,
-		)
-		if err != nil {
-			return fmt.Errorf("decoding repetition levels: %w", err)
-		}
-		if len(repetitions) != numValues {
-			return fmt.Errorf("decoded %d repetition levels for %d values", len(repetitions), numValues)
-		}
-	}
-
-	var page Page
-	if column.maxRepetitionLevel > 0 {
-		page = newRepeatedPage(
-			column.ColumnBuffer.Page(),
-			column.maxRepetitionLevel,
-			column.maxDefinitionLevel,
-			repetitions,
-			definitions,
-		)
-	} else {
-		page = newOptionalPage(column.ColumnBuffer.Page(), column.maxDefinitionLevel, definitions)
-	}
-
-	reader := page.Values()
-	values := make([]Value, writerLevelBufferSize)
-	for {
-		n, err := reader.ReadValues(values)
-		if n > 0 {
-			written, writeErr := dst.WriteValues(values[:n])
-			if writeErr != nil {
-				return writeErr
-			}
-			if written != n {
-				return io.ErrShortWrite
-			}
-		}
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrNoProgress
-		}
-	}
+	column.appendLevelRun(levels, max(rows.Len(), 1))
 }
 
-func decodeWriterLevels(encoded, tail []byte, maxLevel byte) ([]byte, error) {
-	bitWidth := bits.Len8(maxLevel)
-	levels, err := levelEncodingsRLE[bitWidth-1].DecodeLevels(nil, encoded)
-	if err != nil {
-		return nil, err
+func (column *writerLevelsColumnBuffer) writeBoolean(levels columnLevels, value bool) {
+	if levels.definitionLevel == column.maxDefinitionLevel {
+		column.ColumnBuffer.writeBoolean(levels, value)
 	}
-	return append(levels, tail...), nil
+	column.appendLevelRun(levels, 1)
+}
+
+func (column *writerLevelsColumnBuffer) writeInt32(levels columnLevels, value int32) {
+	if levels.definitionLevel == column.maxDefinitionLevel {
+		column.ColumnBuffer.writeInt32(levels, value)
+	}
+	column.appendLevelRun(levels, 1)
+}
+
+func (column *writerLevelsColumnBuffer) writeInt64(levels columnLevels, value int64) {
+	if levels.definitionLevel == column.maxDefinitionLevel {
+		column.ColumnBuffer.writeInt64(levels, value)
+	}
+	column.appendLevelRun(levels, 1)
+}
+
+func (column *writerLevelsColumnBuffer) writeInt96(levels columnLevels, value deprecated.Int96) {
+	if levels.definitionLevel == column.maxDefinitionLevel {
+		column.ColumnBuffer.writeInt96(levels, value)
+	}
+	column.appendLevelRun(levels, 1)
+}
+
+func (column *writerLevelsColumnBuffer) writeFloat(levels columnLevels, value float32) {
+	if levels.definitionLevel == column.maxDefinitionLevel {
+		column.ColumnBuffer.writeFloat(levels, value)
+	}
+	column.appendLevelRun(levels, 1)
+}
+
+func (column *writerLevelsColumnBuffer) writeDouble(levels columnLevels, value float64) {
+	if levels.definitionLevel == column.maxDefinitionLevel {
+		column.ColumnBuffer.writeDouble(levels, value)
+	}
+	column.appendLevelRun(levels, 1)
+}
+
+func (column *writerLevelsColumnBuffer) writeByteArray(levels columnLevels, value []byte) {
+	if levels.definitionLevel == column.maxDefinitionLevel {
+		column.ColumnBuffer.writeByteArray(levels, value)
+	}
+	column.appendLevelRun(levels, 1)
+}
+
+func (column *writerLevelsColumnBuffer) writeNull(levels columnLevels) {
+	column.appendLevelRun(levels, 1)
+}
+
+func (column *writerLevelsColumnBuffer) appendLevelRun(levels columnLevels, count int) {
+	for count > 0 {
+		n := count
+		if column.maxDefinitionLevel > 0 {
+			n = min(n, writerLevelBufferSize-column.definitionTail.Len())
+		}
+		if column.maxRepetitionLevel > 0 {
+			n = min(n, writerLevelBufferSize-column.repetitionTail.Len())
+		}
+
+		if column.maxDefinitionLevel > 0 {
+			i := column.definitionTail.Len()
+			column.definitionTail.Resize(i + n)
+			definitions := column.definitionTail.Slice()[i:]
+			for i := range definitions {
+				definitions[i] = levels.definitionLevel
+			}
+			column.definitionHistogram[levels.definitionLevel] += int64(n)
+			if levels.definitionLevel != column.maxDefinitionLevel {
+				column.numNulls += int64(n)
+			}
+		}
+		if column.maxRepetitionLevel > 0 {
+			i := column.repetitionTail.Len()
+			column.repetitionTail.Resize(i + n)
+			repetitions := column.repetitionTail.Slice()[i:]
+			for i := range repetitions {
+				repetitions[i] = levels.repetitionLevel
+			}
+			column.repetitionHistogram[levels.repetitionLevel] += int64(n)
+			if levels.repetitionLevel == 0 {
+				column.numRows += int64(n)
+			}
+		} else {
+			column.numRows += int64(n)
+		}
+		column.numValues += int64(n)
+		count -= n
+
+		if column.repetitionTail.Len() == writerLevelBufferSize {
+			if err := column.flushRepetitionTail(); err != nil {
+				panic(err)
+			}
+		}
+		if column.definitionTail.Len() == writerLevelBufferSize {
+			if err := column.flushDefinitionTail(); err != nil {
+				panic(err)
+			}
+		}
+	}
 }
 
 func (column *writerLevelsColumnBuffer) appendLevels(values []Value) error {
