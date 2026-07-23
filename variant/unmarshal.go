@@ -162,18 +162,14 @@ func decodeGoArray(m Metadata, header byte, data []byte) (any, error) {
 	offsetsStart := pos
 	valueDataStart := offsetsStart + (numElements+1)*offsetSz
 
+	// The count check above guarantees the complete offset table, so each
+	// in-place read below has a supported width and sufficient input bytes.
+	start, _, _ := readUint(data[offsetsStart:], offsetSz)
+	offsetPos := offsetsStart + offsetSz
 	out := make([]any, numElements)
-	offsetPos := offsetsStart
 	for i := range numElements {
-		start, _, err := readUint(data[offsetPos:], offsetSz)
-		if err != nil {
-			return nil, fmt.Errorf("variant value: reading array offset %d: %w", i, err)
-		}
+		end, _, _ := readUint(data[offsetPos:], offsetSz)
 		offsetPos += offsetSz
-		end, _, err := readUint(data[offsetPos:], offsetSz)
-		if err != nil {
-			return nil, fmt.Errorf("variant value: reading array offset %d: %w", i+1, err)
-		}
 
 		elemStart := valueDataStart + start
 		elemEnd := valueDataStart + end
@@ -186,6 +182,7 @@ func decodeGoArray(m Metadata, header byte, data []byte) (any, error) {
 			return nil, fmt.Errorf("variant value: array element %d: %w", i, err)
 		}
 		out[i] = value
+		start = end
 	}
 
 	return out, nil
