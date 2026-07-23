@@ -2,6 +2,7 @@ package parquet
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"sync"
@@ -299,6 +300,76 @@ func (splitBlockEncoding) EncodeByteArray(dst []byte, src []byte, offsets []uint
 
 	filter.InsertBulk(buffer)
 	return dst, nil
+}
+
+// writeSplitBlockHashJournal records the same hashes used by splitBlockEncoding
+// without choosing a filter block. That choice is deferred until the row group
+// has its final value count and hence its final filter size.
+func writeSplitBlockHashJournal(w io.Writer, src []byte, offsets []uint32) error {
+	if len(offsets) < 2 {
+		return nil
+	}
+
+	var (
+		hashes [filterEncodeBufferSize]uint64
+		buffer [filterEncodeBufferSize * 8]byte
+	)
+	writeHashes := func(n int) error {
+		for i, hash := range hashes[:n] {
+			binary.LittleEndian.PutUint64(buffer[8*i:], hash)
+		}
+		written, err := w.Write(buffer[:8*n])
+		if err != nil {
+			return err
+		}
+		if written != 8*n {
+			return io.ErrShortWrite
+		}
+		return nil
+	}
+
+	baseOffset := offsets[0]
+	count := 0
+	for _, endOffset := range offsets[1:] {
+		hashes[count] = xxhash.Sum64(src[baseOffset:endOffset:endOffset])
+		baseOffset = endOffset
+		count++
+		if count == len(hashes) {
+			if err := writeHashes(count); err != nil {
+				return err
+			}
+			count = 0
+		}
+	}
+	return writeHashes(count)
+}
+
+func insertSplitBlockHashJournal(dst []byte, r io.Reader, size int64) error {
+	if size%8 != 0 {
+		return fmt.Errorf("bloom hash journal size %d is not a multiple of 8", size)
+	}
+
+	filter := bloom.MakeSplitBlockFilter(dst)
+	var (
+		hashes [filterEncodeBufferSize]uint64
+		buffer [filterEncodeBufferSize * 8]byte
+	)
+
+	for size > 0 {
+		n := len(buffer)
+		if int64(n) > size {
+			n = int(size)
+		}
+		if _, err := io.ReadFull(r, buffer[:n]); err != nil {
+			return fmt.Errorf("reading bloom hash journal: %w", err)
+		}
+		for i := range hashes[:n/8] {
+			hashes[i] = binary.LittleEndian.Uint64(buffer[8*i:])
+		}
+		filter.InsertBulk(hashes[:n/8])
+		size -= int64(n)
+	}
+	return nil
 }
 
 func (splitBlockEncoding) EncodeFixedLenByteArray(dst []byte, src []byte, size int) ([]byte, error) {

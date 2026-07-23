@@ -1915,9 +1915,11 @@ func (wb *writerBuffers) swapPageAndScratchBuffers() {
 
 // ColumnWriter writes values for a single column to underlying medium.
 type ColumnWriter struct {
-	pool       BufferPool
-	pageBuffer io.ReadWriteSeeker
-	numPages   int
+	pool                 BufferPool
+	pageBuffer           io.ReadWriteSeeker
+	bloomHashJournal     io.ReadWriteSeeker
+	bloomHashJournalSize int64
+	numPages             int
 
 	columnPath             columnPath
 	columnType             Type
@@ -2001,6 +2003,11 @@ func (c *ColumnWriter) reset() {
 		c.pool.PutBuffer(c.pageBuffer)
 		c.pageBuffer = nil
 	}
+	if c.bloomHashJournal != nil {
+		c.pool.PutBuffer(c.bloomHashJournal)
+		c.bloomHashJournal = nil
+	}
+	c.bloomHashJournalSize = 0
 	c.numPages = 0
 	c.copied = nil
 	// Bloom filters may change in size between row groups, but we retain the
@@ -2107,17 +2114,22 @@ func (c *ColumnWriter) flushFilterPages() (err error) {
 
 	// When the filter was not allocated, the writer did not know how many
 	// values were going to be seen and therefore could not properly size the
-	// filter ahead of time. In this case, we read back all the pages that we
-	// have encoded and copy their values back to the filter.
-	//
-	// A prior implementation of the column writer used to create in-memory
-	// copies of the pages to avoid this decoding step; however, this unbounded
-	// allocation caused memory exhaustion in production applications. CPU being
-	// a somewhat more stretchable resource, we prefer spending time on this
-	// decoding step than having to trigger incident response when production
-	// systems are getting OOM-Killed.
+	// filter ahead of time. Now that the final value count is known, the filter
+	// can be sized before either folding a hash journal or replaying the pages.
 	c.resizeBloomFilter(c.columnChunk.MetaData.NumValues)
+	if c.bloomHashJournal != nil {
+		if offset, err := c.bloomHashJournal.Seek(0, io.SeekStart); err != nil {
+			return err
+		} else if offset != 0 {
+			return fmt.Errorf("resetting bloom hash journal to the start expected offset zero but got %d", offset)
+		}
+		return insertSplitBlockHashJournal(c.filter, c.bloomHashJournal, c.bloomHashJournalSize)
+	}
 
+	// A prior implementation of the column writer used to create in-memory
+	// copies of pages to avoid this decoding step; however, this unbounded
+	// allocation caused memory exhaustion in production applications. For paths
+	// without a compact hash journal, retain the bounded replay fallback.
 	column := &Column{
 		// Set all the fields required by the decodeDataPage* methods.
 		typ:                c.columnType,
@@ -2396,13 +2408,17 @@ func (c *ColumnWriter) writeDataPage(page Page) (int64, error) {
 		}
 	}
 
-	if page.Dictionary() == nil && len(c.filter) > 0 {
-		// When the writer knows the number of values in advance (e.g. when
-		// writing a full row group), the filter encoding is set and the page
-		// can be directly applied to the filter, which minimizes memory usage
-		// since there is no need to buffer the values in order to determine
-		// the size of the filter.
-		if err := c.writePageToFilter(page); err != nil {
+	if page.Dictionary() == nil && c.columnFilter != nil {
+		if len(c.filter) > 0 {
+			// When the writer knows the number of values in advance (e.g. when
+			// writing a full row group), the filter encoding is set and the page
+			// can be directly applied to the filter, which minimizes memory usage
+			// since there is no need to buffer the values in order to determine
+			// the size of the filter.
+			if err := c.writePageToFilter(page); err != nil {
+				return 0, err
+			}
+		} else if err := c.writePageToBloomHashJournal(page); err != nil {
 			return 0, err
 		}
 	}
@@ -2584,6 +2600,46 @@ func (c *ColumnWriter) patchEncryptedCompressedSize(encSize int64, plainHeaderLe
 	if n := len(c.offsetIndex.PageLocations); n > 0 {
 		c.offsetIndex.PageLocations[n-1].CompressedPageSize = int32(encSize)
 	}
+}
+
+func (c *ColumnWriter) writePageToBloomHashJournal(page Page) error {
+	// Only the built-in split-block filter can fold value hashes into its final
+	// bitmap. Other BloomFilterColumn implementations retain the existing replay
+	// path until they expose an equivalent finalization operation.
+	if c.columnFilter == nil || c.dictionary != nil {
+		return nil
+	}
+	if _, ok := c.columnFilter.(splitBlockFilter); !ok {
+		return nil
+	}
+
+	pageData := page.Data()
+	if pageData.Kind() != encoding.ByteArray {
+		return nil
+	}
+	data, offsets := pageData.ByteArray()
+	if len(offsets) < 2 {
+		return nil
+	}
+
+	if c.bloomHashJournal == nil {
+		// BufferPool does not prescribe a returned buffer's cursor or content.
+		// Start the journal at zero and retain its exact written extent below.
+		journal := c.pool.GetBuffer()
+		if offset, err := journal.Seek(0, io.SeekStart); err != nil {
+			c.pool.PutBuffer(journal)
+			return err
+		} else if offset != 0 {
+			c.pool.PutBuffer(journal)
+			return fmt.Errorf("resetting bloom hash journal to the start expected offset zero but got %d", offset)
+		}
+		c.bloomHashJournal = journal
+	}
+	if err := writeSplitBlockHashJournal(c.bloomHashJournal, data, offsets); err != nil {
+		return err
+	}
+	c.bloomHashJournalSize += int64(len(offsets)-1) * 8
+	return nil
 }
 
 func (c *ColumnWriter) writePageToFilter(page Page) (err error) {
