@@ -14,27 +14,30 @@ import (
 // reaches the target number of rows, then written to a temporary row group.
 // When the writer is flushed or closed, the temporary row groups are merged
 // into a row group in the output file, ensuring that rows remain sorted in the
-// final row group. Required INT64 layouts with one ascending sorting column,
-// using the built-in in-memory pool and no compression, retain compact run
-// values instead of materializing temporary row groups.
+// final row group.
 //
-// Encoded and compressed temporary row groups hold a lot less memory than if
-// all rows were retained in memory. Sorting then merging rows chunks also tends
-// to be a lot more efficient than sorting all rows in memory as it results in
-// better CPU cache utilization since sorting multi-megabyte arrays causes a lot
-// of cache misses since the data set cannot be held in CPU caches.
+// Because row groups get encoded and compressed, they hold a lot less memory
+// than if all rows were retained in memory. Sorting then merging rows chunks
+// also tends to be a lot more efficient than sorting all rows in memory as it
+// results in better CPU cache utilization since sorting multi-megabyte arrays
+// causes a lot of cache misses since the data set cannot be held in CPU caches.
+//
+// Required INT64 layouts with one ascending sorting column, using the built-in
+// in-memory pool and no compression, retain compact run values instead of
+// materializing temporary row groups.
 type SortingWriter[T any] struct {
-	rowbuf            *RowBuffer[T]
-	config            *WriterConfig
-	writer            *GenericWriter[T] // temporary-run fallback only
-	output            *GenericWriter[T]
-	buffer            io.ReadWriteSeeker
-	compactInt64Runs  bool
-	inMemoryInt64Runs *inMemoryInt64Runs
-	maxRows           int64
-	numRows           int64
-	sorting           SortingConfig
-	dedupe            dedupe
+	rowbuf                 *RowBuffer[T]
+	config                 *WriterConfig
+	writer                 *GenericWriter[T] // temporary-run fallback only
+	output                 *GenericWriter[T]
+	buffer                 io.ReadWriteSeeker
+	compactInt64Runs       bool
+	compactInt64RunColumns int
+	inMemoryInt64Runs      *inMemoryInt64Runs
+	maxRows                int64
+	numRows                int64
+	sorting                SortingConfig
+	dedupe                 dedupe
 }
 
 // NewSortingWriter constructs a new sorting writer which writes a parquet file
@@ -69,6 +72,9 @@ func NewSortingWriter[T any](output io.Writer, sortRowCount int64, options ...Wr
 			config.Sorting.SortingBuffers,
 		)
 		w.compactInt64Runs = w.inMemoryInt64Runs != nil
+		if w.compactInt64Runs {
+			w.compactInt64RunColumns = w.inMemoryInt64Runs.columns
+		}
 	}
 	if w.inMemoryInt64Runs == nil {
 		w.writer = w.temporaryWriter()
@@ -263,9 +269,9 @@ type inMemoryInt64Runs struct {
 	hasMaxKey bool
 }
 
-func (r *inMemoryInt64Runs) validateRows(rows []Row) error {
+func validateInMemoryInt64RunRows(rows []Row, columns int) error {
 	for _, row := range rows {
-		if len(row) != r.columns {
+		if len(row) != columns {
 			return errInvalidInMemoryInt64Row
 		}
 		for column, value := range row {
@@ -382,8 +388,8 @@ func (w *SortingWriter[T]) Write(rows []T) (int, error) {
 }
 
 func (w *SortingWriter[T]) WriteRows(rows []Row) (int, error) {
-	if w.inMemoryInt64Runs != nil {
-		if err := w.inMemoryInt64Runs.validateRows(rows); err != nil {
+	if w.compactInt64Runs {
+		if err := validateInMemoryInt64RunRows(rows, w.compactInt64RunColumns); err != nil {
 			return 0, err
 		}
 	}
@@ -430,6 +436,7 @@ func (w *SortingWriter[T]) sortAndWriteBufferedRows() error {
 		return nil
 	}
 
+	inputWasSorted := sort.IsSorted(w.rowbuf)
 	sort.Sort(w.rowbuf)
 
 	if w.sorting.DropDuplicatedRows {
@@ -442,7 +449,10 @@ func (w *SortingWriter[T]) sortAndWriteBufferedRows() error {
 			w.rowbuf.Reset()
 			return ErrTooManyRowGroups
 		}
-		if w.inMemoryInt64Runs.shouldMaterialize(w.rowbuf.rows) {
+		// Avoid compact-first replay when a multi-row stream begins sorted: the
+		// materialized path can preserve its chunk-oriented close behavior.
+		if (len(w.inMemoryInt64Runs.runs) == 0 && len(w.rowbuf.rows) > 1 && inputWasSorted) ||
+			w.inMemoryInt64Runs.shouldMaterialize(w.rowbuf.rows) {
 			if err := w.materializeInMemoryInt64Runs(); err != nil {
 				return err
 			}

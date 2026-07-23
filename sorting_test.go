@@ -169,6 +169,65 @@ func TestSortingWriterInt64WriteRowsRejectsInvalidColumns(t *testing.T) {
 	}
 }
 
+func TestSortingWriterInt64WriteRowsRejectsInvalidColumnsAfterMaterializing(t *testing.T) {
+	type Row struct {
+		Payload int64 `parquet:"payload"`
+		Key     int64 `parquet:"key"`
+	}
+
+	schema := parquet.SchemaOf(Row{})
+	toRows := func(rows []Row) []parquet.Row {
+		values := make([]parquet.Row, len(rows))
+		for i := range rows {
+			values[i] = schema.Deconstruct(nil, rows[i])
+		}
+		return values
+	}
+
+	var output bytes.Buffer
+	writer := parquet.NewSortingWriter[Row](&output, 2,
+		parquet.SortingWriterConfig(
+			parquet.SortingColumns(parquet.Ascending("key")),
+		),
+	)
+	first := []Row{{Payload: 10, Key: 1}, {Payload: 20, Key: 0}}
+	second := []Row{{Payload: 30, Key: 3}, {Payload: 40, Key: 2}}
+	if _, err := writer.WriteRows(toRows(first)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.WriteRows(toRows(second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, invalid := range []parquet.Row{
+		{parquet.Int64Value(4).Level(0, 0, 1), parquet.Int64Value(50).Level(0, 0, 0)},
+		{parquet.Int64Value(60), parquet.Int64Value(5)},
+	} {
+		if n, err := writer.WriteRows([]parquet.Row{invalid}); err == nil || n != 0 {
+			t.Fatalf("WriteRows() = (%d, %v), want (0, validation error)", n, err)
+		}
+	}
+
+	third := []Row{{Payload: 70, Key: 4}}
+	if _, err := writer.WriteRows(toRows(third)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := parquet.Read[Row](bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append(append(first, second...), third...)
+	slices.SortFunc(want, func(a, b Row) int { return cmp.Compare(a.Key, b.Key) })
+	assertRowsEqual(t, want, got)
+}
+
 // TestSortingWriterMultipleFlush verifies that calling Flush() multiple times
 // still produces a globally sorted output with a single row group.
 // This tests the fix for the issue where multiple Flush() calls would create
