@@ -510,6 +510,26 @@ func testWriteRowsColumnsGeospatialLevelPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	reader := file.RowGroups()[0].Rows()
+	defer reader.Close()
+	got := make([]parquet.Row, len(rows))
+	if n, err := reader.ReadRows(got); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	} else if n != len(got) {
+		t.Fatalf("reader returned %d rows, want %d", n, len(got))
+	}
+	for i := range rows {
+		if rows[i][0].IsNull() {
+			if len(got[i]) != 1 || !got[i][0].IsNull() {
+				t.Errorf("row %d = %v, want null geometry", i, got[i])
+			}
+		} else if len(got[i]) != 1 {
+			t.Errorf("row %d has %d values, want 1", i, len(got[i]))
+		} else if !bytes.Equal(got[i][0].ByteArray(), rows[i][0].ByteArray()) {
+			t.Errorf("row %d geometry = %x, want %x", i, got[i][0].ByteArray(), rows[i][0].ByteArray())
+		}
+	}
+
 	stats := file.Metadata().RowGroups[0].Columns[0].MetaData.GeospatialStatistics
 	if stats.BBox.XMin != 1 || stats.BBox.XMax != 5 || stats.BBox.YMin != 2 || stats.BBox.YMax != 6 {
 		t.Errorf("bounding box = [%v %v] x [%v %v], want [1 5] x [2 6]", stats.BBox.XMin, stats.BBox.XMax, stats.BBox.YMin, stats.BBox.YMax)
