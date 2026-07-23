@@ -200,6 +200,43 @@ type rowReaderNoWriterTo struct {
 
 func (r rowReaderNoWriterTo) Schema() *Schema { return r.schema }
 
+// rowGroupCopyWriter is implemented by writers that can accept a pristine,
+// transparent row group without changing CopyRows' append semantics.
+//
+// The method is intentionally private: generic RowGroupWriter implementations
+// may complete only part of a group, while this optimization must either consume
+// the whole source group or fall back to row-by-row copying.
+type rowGroupCopyWriter interface {
+	writeRowGroupFromRows(*rowGroupRows) (int64, bool, error)
+}
+
+// validateRowGroupRows fully consumes a fresh reader for rowGroup. A verbatim
+// handoff otherwise skips the page decompression and value decoding that
+// CopyRows performs, which would turn a corrupt persisted input into a
+// successful unchecked copy. Reading assembled rows also preserves validation
+// of the relationship between columns, rather than validating each column in
+// isolation.
+func validateRowGroupRows(rowGroup RowGroup) error {
+	rows := rowGroup.Rows()
+	defer rows.Close()
+
+	buffer := make([]Row, defaultRowBufferSize)
+	defer clearRows(buffer)
+	for {
+		n, err := rows.ReadRows(buffer)
+		clearRows(buffer[:n])
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
+	}
+}
+
 type columnChunkRows struct {
 	offset int32
 	length int32
@@ -292,18 +329,17 @@ func (r *rowGroupRows) SeekToRow(rowIndex int64) error {
 
 func (r *rowGroupRows) WriteRowsTo(w RowWriter) (int64, error) {
 	if !r.closed && r.rowIndex < 0 && chunkTransparentRowGroup(r.rowGroup) {
-		if w, ok := w.(RowGroupWriter); ok {
-			// A destination may split this source row group, but CopyRows must
-			// report all source rows consumed rather than the final output group.
-			numRows := r.rowGroup.NumRows()
-			n, err := w.WriteRowGroup(r.rowGroup)
-			if err != nil {
-				return n, err
+		if w, ok := w.(rowGroupCopyWriter); ok {
+			n, copied, err := w.writeRowGroupFromRows(r)
+			if copied {
+				if err != nil {
+					return n, err
+				}
+				if err := r.SeekToRow(n); err != nil {
+					return n, err
+				}
+				return n, nil
 			}
-			if err := r.SeekToRow(numRows); err != nil {
-				return n, err
-			}
-			return numRows, nil
 		}
 	}
 	return copyRows(w, rowReaderNoWriterTo{RowReader: r, schema: r.schema}, nil)
@@ -517,7 +553,6 @@ func (emptyPages) Close() error            { return nil }
 
 var (
 	_ RowReaderWithSchema = (*rowGroupRows)(nil)
-	_ RowWriterTo         = (*rowGroupRows)(nil)
 
 	_ RowReaderWithSchema = emptyRows{}
 	_ RowWriterTo         = emptyRows{}

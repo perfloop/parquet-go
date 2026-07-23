@@ -288,6 +288,10 @@ func (w *GenericWriter[T]) WriteRowGroup(rowGroup RowGroup) (int64, error) {
 	return w.base.WriteRowGroup(rowGroup)
 }
 
+func (w *GenericWriter[T]) writeRowGroupFromRows(rows *rowGroupRows) (int64, bool, error) {
+	return w.base.writeRowGroupFromRows(rows)
+}
+
 // SetKeyValueMetadata sets a key/value pair in the Parquet file metadata.
 //
 // Keys are assumed to be unique, if the same key is repeated multiple times the
@@ -594,6 +598,47 @@ func (w *Writer) WriteRowGroup(rowGroup RowGroup) (int64, error) {
 		return n, err
 	}
 	return w.writer.writeRowGroup(w.writer.currentRowGroup, rowGroup.Schema(), rowGroup.SortingColumns())
+}
+
+// writeRowGroupFromRows accepts a direct row-group handoff only for an L0
+// file copy whose source has been fully decoded and validated, and whose append
+// behavior matches ReadRowsFrom.
+// WriteRowGroup would otherwise flush a non-empty or not-yet-full destination,
+// split an oversized source group, or import source sorting metadata. Each would
+// change CopyRows' output row-group partitioning or metadata.
+func (w *Writer) writeRowGroupFromRows(rows *rowGroupRows) (int64, bool, error) {
+	rowGroup, ok := rows.rowGroup.(*FileRowGroup)
+	if !ok {
+		return 0, false, nil
+	}
+	if rowGroup.NumRows() != w.config.MaxRowsPerRowGroup ||
+		(w.writer != nil && w.writer.currentRowGroup.numRows != 0) {
+		return 0, false, nil
+	}
+
+	rowGroupSchema := rowGroup.Schema()
+	switch {
+	case rowGroupSchema == nil:
+		return 0, true, ErrRowGroupSchemaMissing
+	case w.schema == nil:
+		w.configure(rowGroupSchema)
+	case !EqualNodes(w.schema, rowGroupSchema):
+		return 0, true, ErrRowGroupSchemaMismatch
+	}
+	sortingColumns := rowGroup.SortingColumns()
+	if len(w.config.Sorting.SortingColumns) != len(sortingColumns) ||
+		!sortingColumnsHavePrefix(sortingColumns, w.config.Sorting.SortingColumns) {
+		return 0, false, nil
+	}
+
+	if _, ok := w.copyableColumnChunks(rowGroup); !ok {
+		return 0, false, nil
+	}
+	if err := validateRowGroupRows(rowGroup); err != nil {
+		return 0, true, err
+	}
+	n, err := w.WriteRowGroup(rowGroup)
+	return n, true, err
 }
 
 // ReadRowsFrom reads rows from the reader passed as arguments and writes them
