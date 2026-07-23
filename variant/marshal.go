@@ -43,7 +43,8 @@ func Unmarshal(metadata, value []byte) (any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("variant unmarshal: %w", err)
 	}
-	v, err := decodeGoValue(m, value)
+	var d goValueDecoder
+	v, err := d.decode(m, value)
 	if err != nil {
 		return nil, fmt.Errorf("variant unmarshal: %w", err)
 	}

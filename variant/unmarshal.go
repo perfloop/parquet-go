@@ -6,19 +6,14 @@ import (
 	"unicode/utf8"
 )
 
-// decodeGoValue decodes a value into the public Go representation returned by
-// Unmarshal. Unlike Decode, it does not materialize a recursive Value tree.
-func decodeGoValue(m Metadata, data []byte) (any, error) {
-	var d goValueDecoder
-	return d.decode(m, data)
-}
-
 type goValueDecoder struct {
 	// strings keeps recent copied values without retaining the caller's input
 	// bytes or allocating for every distinct value.
 	strings [3]string
 }
 
+// decode decodes a value into the public Go representation returned by
+// Unmarshal. Unlike Decode, it does not materialize a recursive Value tree.
 func (d *goValueDecoder) decode(m Metadata, data []byte) (any, error) {
 	if len(data) == 0 {
 		return nil, errors.New("variant value: empty data")
