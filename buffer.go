@@ -4,7 +4,6 @@ import (
 	"log"
 	"reflect"
 	"runtime"
-	"slices"
 	"sort"
 	"sync/atomic"
 
@@ -195,7 +194,12 @@ type Buffer struct {
 	chunks         []ColumnChunk
 	columns        []ColumnBuffer
 	byteArraySizes []int
-	sorted         []ColumnBuffer
+	sorted         []bufferSortingColumn
+}
+
+type bufferSortingColumn struct {
+	columnIndex int
+	descending  bool
 }
 
 // NewBuffer constructs a new buffer, using the given list of buffer options
@@ -238,7 +242,10 @@ func (buf *Buffer) configure(schema *Schema) {
 		return
 	}
 	sortingColumns := buf.config.Sorting.SortingColumns
-	buf.sorted = make([]ColumnBuffer, len(sortingColumns))
+	buf.sorted = make([]bufferSortingColumn, len(sortingColumns))
+	for i := range buf.sorted {
+		buf.sorted[i].columnIndex = -1
+	}
 
 	forEachLeafColumnOf(schema, func(leaf leafColumn) {
 		nullOrdering := nullsGoLast
@@ -273,14 +280,20 @@ func (buf *Buffer) configure(schema *Schema) {
 		buf.columns = append(buf.columns, column)
 
 		if sortingIndex < len(sortingColumns) {
-			if sortingColumns[sortingIndex].Descending() {
-				column = &reversedColumnBuffer{column}
+			buf.sorted[sortingIndex] = bufferSortingColumn{
+				columnIndex: columnIndex,
+				descending:  sortingColumns[sortingIndex].Descending(),
 			}
-			buf.sorted[sortingIndex] = column
 		}
 	})
 
-	buf.sorted = slices.DeleteFunc(buf.sorted, func(cb ColumnBuffer) bool { return cb == nil })
+	sorted := buf.sorted[:0]
+	for _, column := range buf.sorted {
+		if column.columnIndex >= 0 {
+			sorted = append(sorted, column)
+		}
+	}
+	buf.sorted = sorted
 
 	buf.schema = schema
 	buf.rowbuf = make([]Row, 0, 1)
@@ -349,11 +362,16 @@ func (buf *Buffer) Len() int {
 
 // Less returns true if row[i] < row[j] in the buffer.
 func (buf *Buffer) Less(i, j int) bool {
-	for _, col := range buf.sorted {
+	for _, sortingColumn := range buf.sorted {
+		left, right := i, j
+		if sortingColumn.descending {
+			left, right = right, left
+		}
+		column := buf.columns[sortingColumn.columnIndex]
 		switch {
-		case col.Less(i, j):
+		case column.Less(left, right):
 			return true
-		case col.Less(j, i):
+		case column.Less(right, left):
 			return false
 		}
 	}
@@ -394,12 +412,9 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 		return 0, ErrRowGroupSchemaMissing
 	}
 
-	numRows := len(rows)
-	numByteArrayRows := buf.writeByteArrayRows(rows)
-	if numByteArrayRows == numRows {
-		return numRows, nil
+	if buf.writeByteArrayRows(rows) {
+		return len(rows), nil
 	}
-	rows = rows[numByteArrayRows:]
 
 	defer func() {
 		for i, colbuf := range buf.colbuf {
@@ -425,52 +440,48 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 		}
 	}
 
-	return numRows, nil
+	return len(rows), nil
 }
 
-// writeByteArrayRows writes the canonical prefix of rows directly to the
-// byte-array columns and returns the number of rows written.
-func (buf *Buffer) writeByteArrayRows(rows []Row) int {
+// writeByteArrayRows writes canonical rows directly to the byte-array columns.
+func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
 	if len(rows) == 0 || len(buf.columns) == 0 {
-		return 0
+		return false
 	}
 
 	for _, column := range buf.columns {
 		if _, ok := column.(*byteArrayColumnBuffer); !ok {
-			return 0
+			return false
 		}
 	}
 
 	numColumns := len(buf.columns)
+	firstColumn := ^uint16(0)
+	lastColumn := ^uint16(numColumns - 1)
+	for _, row := range rows {
+		if len(row) != numColumns ||
+			row[0].columnIndex != firstColumn ||
+			row[numColumns-1].columnIndex != lastColumn {
+			return false
+		}
+	}
+
 	byteArraySizes := buf.byteArraySizes
 	clear(byteArraySizes)
-
-	numRows := 0
-canonicalRows:
 	for _, row := range rows {
-		if len(row) != numColumns {
-			break
-		}
 		for columnIndex := range row {
 			value := &row[columnIndex]
 			if value.columnIndex != ^uint16(columnIndex) {
-				for i := range columnIndex {
-					byteArraySizes[i] -= int(row[i].u64)
-				}
-				break canonicalRows
+				return false
 			}
 			byteArraySizes[columnIndex] += int(value.u64)
 		}
-		numRows++
 	}
 
-	if numRows == 0 {
-		return 0
-	}
 	for columnIndex, column := range buf.columns {
-		column.(*byteArrayColumnBuffer).writeRows(rows[:numRows], columnIndex, byteArraySizes[columnIndex])
+		column.(*byteArrayColumnBuffer).writeRows(rows, columnIndex, byteArraySizes[columnIndex])
 	}
-	return numRows
+	return true
 }
 
 // WriteRowGroup satisfies the RowGroupWriter interface.

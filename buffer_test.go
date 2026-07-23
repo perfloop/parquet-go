@@ -545,51 +545,6 @@ func TestBuffer(t *testing.T) {
 		}
 	})
 
-	t.Run("canonical byte-array prefix before noncanonical row", func(t *testing.T) {
-		type record struct {
-			First  string
-			Second string
-		}
-
-		want := []record{
-			{First: "first-0", Second: "second-0"},
-			{First: "first-1", Second: "second-1"},
-			{First: "first-2", Second: "second-2"},
-		}
-		schema := parquet.SchemaOf(record{})
-		rows := make([]parquet.Row, len(want))
-		for i := range want {
-			rows[i] = schema.Deconstruct(nil, want[i])
-		}
-		rows[len(rows)-1][0], rows[len(rows)-1][1] = rows[len(rows)-1][1], rows[len(rows)-1][0]
-
-		buffer := parquet.NewBuffer(schema)
-		if n, err := buffer.WriteRows(rows); err != nil || n != len(rows) {
-			t.Fatalf("WriteRows() = %d, %v; want %d, nil", n, err, len(rows))
-		}
-
-		gotRows := make([]parquet.Row, len(want))
-		reader := buffer.Rows()
-		defer reader.Close()
-		n, err := reader.ReadRows(gotRows)
-		if err != nil && !errors.Is(err, io.EOF) {
-			t.Fatal(err)
-		}
-		if n != len(gotRows) {
-			t.Fatalf("ReadRows() = %d; want %d", n, len(gotRows))
-		}
-
-		for i := range gotRows {
-			var got record
-			if err := schema.Reconstruct(&got, gotRows[i]); err != nil {
-				t.Fatalf("Reconstruct(%d): %v", i, err)
-			}
-			if got != want[i] {
-				t.Fatalf("row %d = %#v; want %#v", i, got, want[i])
-			}
-		}
-	})
-
 	t.Run("uses replacement byte-array column buffers", func(t *testing.T) {
 		type record struct {
 			First  string
@@ -627,6 +582,58 @@ func TestBuffer(t *testing.T) {
 		}
 		if got != want {
 			t.Fatalf("row = %#v; want %#v", got, want)
+		}
+	})
+
+	t.Run("sorts replacement byte-array column buffers", func(t *testing.T) {
+		type record struct {
+			First  string
+			Second string
+		}
+
+		schema := parquet.SchemaOf(record{})
+		buffer := parquet.NewBuffer(schema,
+			parquet.SortingRowGroupConfig(
+				parquet.SortingColumns(parquet.Ascending("First")),
+			),
+		)
+		columns := buffer.ColumnBuffers()
+		columns[0] = parquet.ByteArrayType.NewColumnBuffer(0, 2)
+
+		input := []record{
+			{First: "first-b", Second: "second-b"},
+			{First: "first-a", Second: "second-a"},
+		}
+		rows := make([]parquet.Row, len(input))
+		for i := range input {
+			rows[i] = schema.Deconstruct(nil, input[i])
+		}
+		if n, err := buffer.WriteRows(rows); err != nil || n != len(rows) {
+			t.Fatalf("WriteRows() = %d, %v; want %d, nil", n, err, len(rows))
+		}
+
+		sort.Sort(buffer)
+
+		reader := buffer.Rows()
+		defer reader.Close()
+		gotRows := make([]parquet.Row, len(input))
+		n, err := reader.ReadRows(gotRows)
+		if err != nil && !errors.Is(err, io.EOF) {
+			t.Fatal(err)
+		}
+		if n != len(gotRows) {
+			t.Fatalf("ReadRows() = %d; want %d", n, len(gotRows))
+		}
+
+		want := []record{input[1], input[0]}
+		for i := range gotRows {
+			var got record
+			if err := schema.Reconstruct(&got, gotRows[i]); err != nil {
+				t.Fatalf("Reconstruct(%d): %v", i, err)
+			}
+			if got != want[i] {
+				t.Fatalf("row %d = %#v; want %#v", i, got, want[i])
+			}
 		}
 	})
 }
