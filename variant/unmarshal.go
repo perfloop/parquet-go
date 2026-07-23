@@ -9,6 +9,17 @@ import (
 // decodeGoValue decodes a value into the public Go representation returned by
 // Unmarshal. Unlike Decode, it does not materialize a recursive Value tree.
 func decodeGoValue(m Metadata, data []byte) (any, error) {
+	var d goValueDecoder
+	return d.decode(m, data)
+}
+
+type goValueDecoder struct {
+	// strings shares copied repeated values within one result without retaining
+	// the caller's input bytes.
+	strings map[string]string
+}
+
+func (d *goValueDecoder) decode(m Metadata, data []byte) (any, error) {
 	if len(data) == 0 {
 		return nil, errors.New("variant value: empty data")
 	}
@@ -18,7 +29,11 @@ func decodeGoValue(m Metadata, data []byte) (any, error) {
 	valueHeader := header >> 2
 
 	if basic == BasicPrimitive {
-		v, _, err := decodePrimitive(PrimitiveType(valueHeader), data[1:])
+		primitive := PrimitiveType(valueHeader)
+		if primitive == PrimitiveString {
+			return d.decodeString(data[1:])
+		}
+		v, _, err := decodePrimitive(primitive, data[1:])
 		if err != nil {
 			return nil, err
 		}
@@ -32,15 +47,43 @@ func decodeGoValue(m Metadata, data []byte) (any, error) {
 		if !utf8.Valid(data[1 : 1+length]) {
 			return nil, errors.New("variant value: short string is not valid UTF-8")
 		}
-		return string(data[1 : 1+length]), nil
+		return d.internString(data[1 : 1+length]), nil
 	}
 	if basic == BasicObject {
-		return decodeGoObject(m, header, data[1:])
+		return d.decodeObject(m, header, data[1:])
 	}
-	return decodeGoArray(m, header, data[1:])
+	return d.decodeArray(m, header, data[1:])
 }
 
-func decodeGoObject(m Metadata, header byte, data []byte) (any, error) {
+func (d *goValueDecoder) decodeString(data []byte) (any, error) {
+	if len(data) < 4 {
+		return nil, errors.New("variant value: not enough data for string length")
+	}
+	length := int(uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24)
+	if length < 0 || length > len(data)-4 {
+		return nil, fmt.Errorf("variant value: string length %d exceeds data", length)
+	}
+	stringData := data[4 : 4+length]
+	if !utf8.Valid(stringData) {
+		return nil, errors.New("variant value: string is not valid UTF-8")
+	}
+	return d.internString(stringData), nil
+}
+
+func (d *goValueDecoder) internString(data []byte) string {
+	if cached, ok := d.strings[string(data)]; ok {
+		return cached
+	}
+
+	s := string(data)
+	if d.strings == nil {
+		d.strings = make(map[string]string)
+	}
+	d.strings[s] = s
+	return s
+}
+
+func (d *goValueDecoder) decodeObject(m Metadata, header byte, data []byte) (any, error) {
 	// Object header byte layout (see encodeObject): bits 2-3 hold
 	// field_offset_size_minus_one, bits 4-5 hold field_id_size_minus_one,
 	// bit 6 holds is_large.
@@ -112,7 +155,7 @@ func decodeGoObject(m Metadata, header byte, data []byte) (any, error) {
 			return nil, fmt.Errorf("variant value: object field %d: invalid value offset", i)
 		}
 
-		value, err := decodeGoValue(m, data[valueStart:valueDataEnd])
+		value, err := d.decode(m, data[valueStart:valueDataEnd])
 		if err != nil {
 			return nil, fmt.Errorf("variant value: object field %q: %w", name, err)
 		}
@@ -122,7 +165,7 @@ func decodeGoObject(m Metadata, header byte, data []byte) (any, error) {
 	return out, nil
 }
 
-func decodeGoArray(m Metadata, header byte, data []byte) (any, error) {
+func (d *goValueDecoder) decodeArray(m Metadata, header byte, data []byte) (any, error) {
 	offsetSzCode := (header >> 2) & 0x03
 	isLarge := (header >> 4) & 0x01
 
@@ -170,7 +213,7 @@ func decodeGoArray(m Metadata, header byte, data []byte) (any, error) {
 			return nil, fmt.Errorf("variant value: array element %d: invalid offset", i)
 		}
 
-		value, err := decodeGoValue(m, data[elemStart:elemEnd])
+		value, err := d.decode(m, data[elemStart:elemEnd])
 		if err != nil {
 			return nil, fmt.Errorf("variant value: array element %d: %w", i, err)
 		}
