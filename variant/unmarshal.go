@@ -17,14 +17,14 @@ func decodeGoValue(m Metadata, data []byte) (any, error) {
 	basic := BasicType(header & 0x03)
 	valueHeader := header >> 2
 
-	switch basic {
-	case BasicPrimitive:
+	if basic == BasicPrimitive {
 		v, _, err := decodePrimitive(PrimitiveType(valueHeader), data[1:])
 		if err != nil {
 			return nil, err
 		}
 		return v.GoValue(), nil
-	case BasicShortString:
+	}
+	if basic == BasicShortString {
 		length := int(valueHeader)
 		if len(data) < 1+length {
 			return nil, fmt.Errorf("variant value: short string length %d exceeds data", length)
@@ -33,13 +33,11 @@ func decodeGoValue(m Metadata, data []byte) (any, error) {
 			return nil, errors.New("variant value: short string is not valid UTF-8")
 		}
 		return string(data[1 : 1+length]), nil
-	case BasicObject:
-		return decodeGoObject(m, header, data[1:])
-	case BasicArray:
-		return decodeGoArray(m, header, data[1:])
-	default:
-		return nil, fmt.Errorf("variant value: unknown basic type %d", basic)
 	}
+	if basic == BasicObject {
+		return decodeGoObject(m, header, data[1:])
+	}
+	return decodeGoArray(m, header, data[1:])
 }
 
 func decodeGoObject(m Metadata, header byte, data []byte) (any, error) {
