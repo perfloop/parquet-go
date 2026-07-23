@@ -60,6 +60,70 @@ func TestSortingWriter(t *testing.T) {
 	assertRowsEqual(t, rows, read)
 }
 
+func TestSortingWriterInt64WriteRows(t *testing.T) {
+	type Row struct {
+		Payload int64 `parquet:"payload"`
+		Key     int64 `parquet:"key"`
+	}
+
+	input := []Row{
+		{Payload: 101, Key: 3},
+		{Payload: 7, Key: 1},
+		{Payload: 99, Key: 2},
+		{Payload: 42, Key: 0},
+		{Payload: 23, Key: 5},
+		{Payload: 88, Key: 4},
+	}
+	schema := parquet.SchemaOf(Row{})
+	rows := make([]parquet.Row, len(input))
+	for i := range input {
+		rows[i] = schema.Deconstruct(nil, input[i])
+	}
+
+	var output bytes.Buffer
+	writer := parquet.NewSortingWriter[Row](&output, 2,
+		parquet.SortingWriterConfig(
+			parquet.SortingColumns(parquet.Ascending("key")),
+		),
+	)
+	if n, err := writer.WriteRows(rows); err != nil {
+		t.Fatal(err)
+	} else if n != len(rows) {
+		t.Fatalf("wrote %d rows, want %d", n, len(rows))
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := parquet.Read[Row](bytes.NewReader(output.Bytes()), int64(output.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := slices.Clone(input)
+	slices.SortFunc(want, func(a, b Row) int { return cmp.Compare(a.Key, b.Key) })
+	assertRowsEqual(t, want, got)
+}
+
+func TestSortingWriterInt64WriteRowsRejectsInvalidColumns(t *testing.T) {
+	type Row struct {
+		Payload int64 `parquet:"payload"`
+		Key     int64 `parquet:"key"`
+	}
+
+	writer := parquet.NewSortingWriter[Row](io.Discard, 2,
+		parquet.SortingWriterConfig(
+			parquet.SortingColumns(parquet.Ascending("key")),
+		),
+	)
+	rows := []parquet.Row{{
+		parquet.Int64Value(2).Level(0, 0, 1),
+		parquet.Int64Value(10).Level(0, 0, 0),
+	}}
+	if n, err := writer.WriteRows(rows); err == nil || n != 0 {
+		t.Fatalf("WriteRows() = (%d, %v), want (0, validation error)", n, err)
+	}
+}
+
 // TestSortingWriterMultipleFlush verifies that calling Flush() multiple times
 // still produces a globally sorted output with a single row group.
 // This tests the fix for the issue where multiple Flush() calls would create
