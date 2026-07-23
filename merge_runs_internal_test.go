@@ -50,6 +50,30 @@ func drainMerged(t *testing.T, m RowReader) []Row {
 	}
 }
 
+// TestConcatenatingRowsWrapperClose keeps the Rows lifecycle used by the
+// page-range direct path consistent with the RowSeeker contract.
+func TestConcatenatingRowsWrapperClose(t *testing.T) {
+	buffer := NewRowBuffer[struct{ Key int64 }]()
+	rows := buffer.Rows()
+	reader := &concatenatingRowsWrapper{
+		reader:  rows,
+		readers: []Rows{rows},
+		schema:  buffer.Schema(),
+	}
+
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, rowIndex := range []int64{0, 1} {
+		if err := reader.SeekToRow(rowIndex); err != io.ErrClosedPipe {
+			t.Fatalf("seek to row %d after close: got %v, want %v", rowIndex, err, io.ErrClosedPipe)
+		}
+	}
+	if n, err := reader.ReadRows(make([]Row, 1)); n != 0 || err != io.EOF {
+		t.Fatalf("read after close: got (%d, %v), want (0, %v)", n, err, io.EOF)
+	}
+}
+
 // TestMergedRowReaderRunDetection verifies that run detection produces exactly
 // the same output (including the order of equal rows) as per-row replay, across
 // random workloads ranging from fully interleaved to fully disjoint, with

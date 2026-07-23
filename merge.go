@@ -297,6 +297,10 @@ type mergedRowGroup struct {
 func (m *mergedRowGroup) rowGroupSegments() []RowGroup { return nil }
 
 func (m *mergedRowGroup) Rows() Rows {
+	if rows, ok := newPageRangeRows(m); ok {
+		return rows
+	}
+
 	// The row group needs to respect a sorting order; the merged row reader
 	// uses a heap to merge rows from the row groups.
 	rows := make([]Rows, len(m.rowGroups))
@@ -312,6 +316,353 @@ func (m *mergedRowGroup) Rows() Rows {
 		rows:   rows,
 		schema: m.schema,
 	}
+}
+
+// pageMergeRange is a row interval whose bounds are the minimum and maximum
+// values of a sorting-column page. last is exclusive.
+type pageMergeRange struct {
+	first int64
+	last  int64
+	min   Value
+	max   Value
+}
+
+// pageMergeSegment describes either a range that can be read directly from one
+// source, or two overlapping ranges that still need the regular row merge.
+type pageMergeSegment struct {
+	direct int
+	ranges [2]pageMergeRange
+}
+
+func newPageRangeRows(m *mergedRowGroup) (Rows, bool) {
+	if len(m.rowGroups) != 2 || len(m.sorting) == 0 {
+		return nil, false
+	}
+	for _, rowGroup := range m.rowGroups {
+		// Page statistics describe the source values. A converted row group may
+		// transform the sorting value or its levels, so retain the established
+		// row-level merge unless its conversion can be proved separately.
+		if _, converted := rowGroup.(*convertedRowGroup); converted {
+			return nil, false
+		}
+	}
+
+	sortingColumn := m.sorting[0]
+	ranges0, columnType, ok := pageMergeRangesOf(m.rowGroups[0], m.schema, sortingColumn)
+	if !ok {
+		return nil, false
+	}
+	ranges1, _, ok := pageMergeRangesOf(m.rowGroups[1], m.schema, sortingColumn)
+	if !ok {
+		return nil, false
+	}
+
+	plan, ok := pageMergePlanOf(ranges0, ranges1, columnType, sortingColumn.Descending())
+	if !ok {
+		return nil, false
+	}
+
+	sources := []Rows{m.rowGroups[0].Rows(), m.rowGroups[1].Rows()}
+	var reader RowReader = &pageRangeMergeReader{
+		compare: m.compare,
+		plan:    plan,
+		sources: [2]Rows{sources[0], sources[1]},
+	}
+	if m.dropDuplicatedRows {
+		reader = DedupeRowReader(reader, m.compare)
+	}
+	return &concatenatingRowsWrapper{
+		reader:  reader,
+		readers: sources,
+		schema:  m.schema,
+	}, true
+}
+
+// pageMergeRangesOf returns page-aligned row intervals for a required,
+// non-repeated leading sorting column. Requiring that shape lets the row
+// interval be shared safely by every column in the row group, and means page
+// bounds cannot conceal null values.
+func pageMergeRangesOf(rowGroup RowGroup, schema *Schema, sortingColumn SortingColumn) ([]pageMergeRange, Type, bool) {
+	if sortingColumn.NullsFirst() {
+		return nil, nil, false
+	}
+
+	leaf, ok := schema.Lookup(sortingColumn.Path()...)
+	if !ok || leaf.MaxRepetitionLevel != 0 || leaf.MaxDefinitionLevel != 0 {
+		return nil, nil, false
+	}
+
+	chunks := rowGroup.ColumnChunks()
+	if leaf.ColumnIndex < 0 || leaf.ColumnIndex >= len(chunks) || !EqualTypes(chunks[leaf.ColumnIndex].Type(), leaf.Node.Type()) {
+		return nil, nil, false
+	}
+	chunk := chunks[leaf.ColumnIndex]
+
+	columnIndex, err := chunk.ColumnIndex()
+	if err != nil {
+		return nil, nil, false
+	}
+	offsetIndex, err := chunk.OffsetIndex()
+	if err != nil {
+		return nil, nil, false
+	}
+
+	numPages := columnIndex.NumPages()
+	if numPages == 0 || numPages != offsetIndex.NumPages() {
+		return nil, nil, false
+	}
+	if sortingColumn.Descending() {
+		if !columnIndex.IsDescending() {
+			return nil, nil, false
+		}
+	} else if !columnIndex.IsAscending() {
+		return nil, nil, false
+	}
+
+	columnType := leaf.Node.Type()
+	ranges := make([]pageMergeRange, numPages)
+	for i := range ranges {
+		first := offsetIndex.FirstRowIndex(i)
+		last := rowGroup.NumRows()
+		if i+1 < len(ranges) {
+			last = offsetIndex.FirstRowIndex(i + 1)
+		}
+		if first < 0 || first >= last || last > rowGroup.NumRows() || columnIndex.NullPage(i) {
+			return nil, nil, false
+		}
+
+		min, max := columnIndex.MinValue(i), columnIndex.MaxValue(i)
+		if sortingColumn.Descending() {
+			min, max = max, min
+		}
+		if min.IsNull() || max.IsNull() || compareValues(min, max, columnType, sortingColumn.Descending()) > 0 {
+			return nil, nil, false
+		}
+		if i > 0 && compareValues(ranges[i-1].max, min, columnType, sortingColumn.Descending()) > 0 {
+			return nil, nil, false
+		}
+		ranges[i] = pageMergeRange{
+			first: first,
+			last:  last,
+			min:   min,
+			max:   max,
+		}
+	}
+
+	if ranges[0].first != 0 || ranges[len(ranges)-1].last != rowGroup.NumRows() {
+		return nil, nil, false
+	}
+	return ranges, columnType, true
+}
+
+// pageMergePlanOf finds connected components of the two streams of page value
+// intervals. Strictly ordered components can be copied from one source without
+// decoding rows from the other; equal bounds stay in a merged component so
+// sorting-column ties retain the normal row-level ordering.
+func pageMergePlanOf(ranges0, ranges1 []pageMergeRange, columnType Type, descending bool) ([]pageMergeSegment, bool) {
+	compare := func(a, b Value) int {
+		return compareValues(a, b, columnType, descending)
+	}
+
+	plan := make([]pageMergeSegment, 0, len(ranges0)+len(ranges1))
+	direct := false
+	appendDirect := func(source int, page pageMergeRange) {
+		if len(plan) > 0 {
+			previous := &plan[len(plan)-1]
+			if previous.direct == source && previous.ranges[source].last == page.first {
+				previous.ranges[source].last = page.last
+				previous.ranges[source].max = page.max
+				return
+			}
+		}
+		segment := pageMergeSegment{direct: source}
+		segment.ranges[source] = page
+		plan = append(plan, segment)
+	}
+
+	i, j := 0, 0
+	for i < len(ranges0) && j < len(ranges1) {
+		left, right := ranges0[i], ranges1[j]
+		switch {
+		case compare(left.max, right.min) < 0:
+			appendDirect(0, left)
+			direct = true
+			i++
+		case compare(right.max, left.min) < 0:
+			appendDirect(1, right)
+			direct = true
+			j++
+		default:
+			startI, startJ := i, j
+			maximum := left.max
+			if compare(right.max, maximum) > 0 {
+				maximum = right.max
+			}
+			i++
+			j++
+
+			for {
+				advanced := false
+				for i < len(ranges0) && compare(ranges0[i].min, maximum) <= 0 {
+					if compare(ranges0[i].max, maximum) > 0 {
+						maximum = ranges0[i].max
+					}
+					i++
+					advanced = true
+				}
+				for j < len(ranges1) && compare(ranges1[j].min, maximum) <= 0 {
+					if compare(ranges1[j].max, maximum) > 0 {
+						maximum = ranges1[j].max
+					}
+					j++
+					advanced = true
+				}
+				if !advanced {
+					break
+				}
+			}
+
+			segment := pageMergeSegment{direct: -1}
+			segment.ranges[0] = pageMergeRange{
+				first: ranges0[startI].first,
+				last:  ranges0[i-1].last,
+			}
+			segment.ranges[1] = pageMergeRange{
+				first: ranges1[startJ].first,
+				last:  ranges1[j-1].last,
+			}
+			plan = append(plan, segment)
+		}
+	}
+	for ; i < len(ranges0); i++ {
+		appendDirect(0, ranges0[i])
+		direct = true
+	}
+	for ; j < len(ranges1); j++ {
+		appendDirect(1, ranges1[j])
+		direct = true
+	}
+
+	return plan, direct
+}
+
+// pageRangeMergeReader executes a pageMergePlan while keeping one forward-only Rows
+// reader per source. A source is consumed in row order even when the output
+// alternates between sources, so no extra page seeking or reader construction
+// is needed for direct page ranges.
+type pageRangeMergeReader struct {
+	compare   func(Row, Row) int
+	plan      []pageMergeSegment
+	sources   [2]Rows
+	positions [2]int64
+	segment   int
+	merge     RowReader
+}
+
+func (r *pageRangeMergeReader) ReadRows(rows []Row) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	for r.segment < len(r.plan) {
+		segment := r.plan[r.segment]
+		if segment.direct >= 0 {
+			sourceIndex := segment.direct
+			pageRange := segment.ranges[sourceIndex]
+			if r.positions[sourceIndex] < pageRange.first || r.positions[sourceIndex] > pageRange.last {
+				return 0, fmt.Errorf("page merge: source %d is at row %d, outside rows [%d:%d]", sourceIndex, r.positions[sourceIndex], pageRange.first, pageRange.last)
+			}
+
+			remaining := pageRange.last - r.positions[sourceIndex]
+			if remaining == 0 {
+				r.segment++
+				continue
+			}
+
+			n := min(len(rows), int(remaining))
+			n, err := r.sources[sourceIndex].ReadRows(rows[:n])
+			r.positions[sourceIndex] += int64(n)
+			if r.positions[sourceIndex] > pageRange.last {
+				return n, fmt.Errorf("page merge: source %d read past row %d", sourceIndex, pageRange.last)
+			}
+			if err == io.EOF {
+				if r.positions[sourceIndex] < pageRange.last {
+					return n, io.ErrUnexpectedEOF
+				}
+				r.segment++
+				if n > 0 {
+					return n, nil
+				}
+				continue
+			}
+			return n, err
+		}
+
+		if r.merge == nil {
+			for sourceIndex, pageRange := range segment.ranges {
+				if r.positions[sourceIndex] != pageRange.first {
+					return 0, fmt.Errorf("page merge: source %d is at row %d, expected row %d", sourceIndex, r.positions[sourceIndex], pageRange.first)
+				}
+			}
+			sources := [2]pageRangeReader{
+				{
+					rows:     r.sources[0],
+					position: &r.positions[0],
+					last:     segment.ranges[0].last,
+				},
+				{
+					rows:     r.sources[1],
+					position: &r.positions[1],
+					last:     segment.ranges[1].last,
+				},
+			}
+			r.merge = mergeRowReaders(sources[:], r.compare)
+		}
+
+		n, err := r.merge.ReadRows(rows)
+		if err == io.EOF {
+			r.merge = nil
+			r.segment++
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, err
+	}
+	return 0, io.EOF
+}
+
+// pageRangeReader bounds a source reader to one residual page component. It
+// updates the shared source position as the merge reader prefetches rows.
+type pageRangeReader struct {
+	rows     Rows
+	position *int64
+	last     int64
+}
+
+func (r pageRangeReader) ReadRows(rows []Row) (int, error) {
+	remaining := r.last - *r.position
+	if remaining == 0 {
+		return 0, io.EOF
+	}
+	if remaining < 0 {
+		return 0, fmt.Errorf("page merge: source read past row %d", r.last)
+	}
+
+	n := min(len(rows), int(remaining))
+	n, err := r.rows.ReadRows(rows[:n])
+	*r.position += int64(n)
+	if *r.position > r.last {
+		return n, fmt.Errorf("page merge: source read past row %d", r.last)
+	}
+	if err == io.EOF && *r.position < r.last {
+		return n, io.ErrUnexpectedEOF
+	}
+	if *r.position == r.last && err == nil {
+		err = io.EOF
+	}
+	return n, err
 }
 
 // sortedSegmentRowGroup wraps a multiRowGroup but overrides Rows() to
@@ -403,15 +754,23 @@ type concatenatingRowsWrapper struct {
 	readers  []Rows
 	schema   *Schema
 	rowIndex int64
+	closed   bool
 }
 
 func (c *concatenatingRowsWrapper) ReadRows(rows []Row) (int, error) {
+	if c.closed {
+		return 0, io.EOF
+	}
 	n, err := c.reader.ReadRows(rows)
 	c.rowIndex += int64(n)
 	return n, err
 }
 
 func (c *concatenatingRowsWrapper) Close() (lastErr error) {
+	if c.closed {
+		return nil
+	}
+	c.closed = true
 	for _, r := range c.readers {
 		if err := r.Close(); err != nil {
 			lastErr = err
@@ -421,6 +780,9 @@ func (c *concatenatingRowsWrapper) Close() (lastErr error) {
 }
 
 func (c *concatenatingRowsWrapper) SeekToRow(rowIndex int64) error {
+	if c.closed {
+		return io.ErrClosedPipe
+	}
 	if rowIndex < c.rowIndex {
 		return fmt.Errorf("SeekToRow: concatenating row reader cannot seek backward from row %d to %d", c.rowIndex, rowIndex)
 	}
