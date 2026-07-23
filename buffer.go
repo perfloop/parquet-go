@@ -443,7 +443,8 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	return len(rows), nil
 }
 
-// writeByteArrayRows writes canonical rows directly to the byte-array columns.
+// writeByteArrayRows writes rows with one BYTE_ARRAY value per column directly
+// to the byte-array columns.
 func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
 	if len(rows) == 0 || len(buf.columns) == 0 {
 		return false
@@ -455,22 +456,17 @@ func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
 		}
 	}
 
-	numColumns := len(buf.columns)
-	for _, row := range rows {
-		if len(row) != numColumns {
-			return false
-		}
-		for columnIndex, value := range row {
-			if value.columnIndex != ^uint16(columnIndex) {
-				return false
-			}
-		}
-	}
-
 	byteArraySizes := buf.byteArraySizes
 	clear(byteArraySizes)
 	for _, row := range rows {
-		for columnIndex, value := range row {
+		if len(row) != len(buf.columns) {
+			return false
+		}
+		for columnIndex := range buf.columns {
+			value := byteArrayRowValue(row, columnIndex)
+			if value == nil {
+				return false
+			}
 			byteArraySizes[columnIndex] += int(value.u64)
 		}
 	}
@@ -479,6 +475,19 @@ func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
 		column.(*byteArrayColumnBuffer).writeRows(rows, columnIndex, byteArraySizes[columnIndex])
 	}
 	return true
+}
+
+func byteArrayRowValue(row Row, columnIndex int) *Value {
+	value := &row[columnIndex]
+	if value.columnIndex == ^uint16(columnIndex) {
+		return value
+	}
+	for i := range row {
+		if row[i].columnIndex == ^uint16(columnIndex) {
+			return &row[i]
+		}
+	}
+	return nil
 }
 
 // WriteRowGroup satisfies the RowGroupWriter interface.
