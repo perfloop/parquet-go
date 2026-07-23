@@ -139,6 +139,35 @@ func (col *byteArrayColumnBuffer) WriteValues(values []Value) (int, error) {
 	return len(values), nil
 }
 
+func (col *byteArrayColumnBuffer) writeRows(rows []Row, columnIndex, totalBytes int) {
+	if col.offsets.Len() > col.lengths.Len() {
+		col.offsets.Resize(col.lengths.Len())
+	}
+
+	n := len(rows)
+	offsetsStart := col.offsets.Len()
+	lengthsStart := col.lengths.Len()
+	valuesStart := col.values.Len()
+
+	col.offsets.Resize(offsetsStart + n)
+	col.lengths.Resize(lengthsStart + n)
+	col.values.Resize(valuesStart + totalBytes)
+
+	offsets := col.offsets.Slice()[offsetsStart : offsetsStart+n]
+	lengths := col.lengths.Slice()[lengthsStart : lengthsStart+n]
+	values := col.values.Slice()[:valuesStart+totalBytes]
+
+	valueOffset := valuesStart
+	for i, row := range rows {
+		value := &row[columnIndex]
+		valueLen := int(value.u64)
+		offsets[i] = uint32(valueOffset)
+		lengths[i] = uint32(valueLen)
+		copy(values[valueOffset:], value.byteArray())
+		valueOffset += valueLen
+	}
+}
+
 func (col *byteArrayColumnBuffer) writeValues(levels columnLevels, rows sparse.Array) {
 	n := rows.Len()
 	if n == 0 {

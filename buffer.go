@@ -188,13 +188,15 @@ var (
 // writing them to a parquet file. Buffer implements sort.Interface as a way
 // to support reordering the rows that have been written to it.
 type Buffer struct {
-	config  *RowGroupConfig
-	schema  *Schema
-	rowbuf  []Row
-	colbuf  [][]Value
-	chunks  []ColumnChunk
-	columns []ColumnBuffer
-	sorted  []ColumnBuffer
+	config           *RowGroupConfig
+	schema           *Schema
+	rowbuf           []Row
+	colbuf           [][]Value
+	chunks           []ColumnChunk
+	columns          []ColumnBuffer
+	byteArrayColumns []*byteArrayColumnBuffer
+	byteArraySizes   []int
+	sorted           []ColumnBuffer
 }
 
 // NewBuffer constructs a new buffer, using the given list of buffer options
@@ -285,6 +287,8 @@ func (buf *Buffer) configure(schema *Schema) {
 	buf.rowbuf = make([]Row, 0, 1)
 	buf.colbuf = make([][]Value, len(buf.columns))
 	buf.chunks = make([]ColumnChunk, len(buf.columns))
+	buf.byteArrayColumns = byteArrayColumnsOf(buf.columns)
+	buf.byteArraySizes = make([]int, len(buf.byteArrayColumns))
 
 	for i, column := range buf.columns {
 		buf.chunks[i] = column
@@ -383,16 +387,20 @@ func (buf *Buffer) Write(row any) error {
 
 // WriteRows writes parquet rows to the buffer.
 func (buf *Buffer) WriteRows(rows []Row) (int, error) {
+	if buf.schema == nil {
+		return 0, ErrRowGroupSchemaMissing
+	}
+
+	if buf.writeByteArrayRows(rows) {
+		return len(rows), nil
+	}
+
 	defer func() {
 		for i, colbuf := range buf.colbuf {
 			clearValues(colbuf)
 			buf.colbuf[i] = colbuf[:0]
 		}
 	}()
-
-	if buf.schema == nil {
-		return 0, ErrRowGroupSchemaMissing
-	}
 
 	for _, row := range rows {
 		for _, value := range row {
@@ -412,6 +420,52 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	}
 
 	return len(rows), nil
+}
+
+func byteArrayColumnsOf(columns []ColumnBuffer) []*byteArrayColumnBuffer {
+	if len(columns) == 0 {
+		return nil
+	}
+
+	for _, column := range columns {
+		if _, ok := column.(*byteArrayColumnBuffer); !ok {
+			return nil
+		}
+	}
+
+	byteArrayColumns := make([]*byteArrayColumnBuffer, len(columns))
+	for i, column := range columns {
+		byteArrayColumns[i] = column.(*byteArrayColumnBuffer)
+	}
+	return byteArrayColumns
+}
+
+func (buf *Buffer) writeByteArrayRows(rows []Row) bool {
+	if len(rows) == 0 || len(buf.byteArrayColumns) == 0 {
+		return false
+	}
+
+	numColumns := len(buf.byteArrayColumns)
+	byteArraySizes := buf.byteArraySizes
+	clear(byteArraySizes)
+
+	for _, row := range rows {
+		if len(row) != numColumns {
+			return false
+		}
+		for columnIndex := range row {
+			value := &row[columnIndex]
+			if value.columnIndex != ^uint16(columnIndex) {
+				return false
+			}
+			byteArraySizes[columnIndex] += int(value.u64)
+		}
+	}
+
+	for columnIndex, column := range buf.byteArrayColumns {
+		column.writeRows(rows, columnIndex, byteArraySizes[columnIndex])
+	}
+	return true
 }
 
 // WriteRowGroup satisfies the RowGroupWriter interface.
