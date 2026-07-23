@@ -1,6 +1,7 @@
 package parquet
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"math/rand"
@@ -50,28 +51,243 @@ func drainMerged(t *testing.T, m RowReader) []Row {
 	}
 }
 
-// TestConcatenatingRowsWrapperClose keeps the Rows lifecycle used by the
-// page-range direct path consistent with the RowSeeker contract.
-func TestConcatenatingRowsWrapperClose(t *testing.T) {
-	buffer := NewRowBuffer[struct{ Key int64 }]()
-	rows := buffer.Rows()
-	reader := &concatenatingRowsWrapper{
-		reader:  rows,
-		readers: []Rows{rows},
-		schema:  buffer.Schema(),
+// TestPageRangeRowsClose keeps the Rows lifecycle of a qualifying direct path
+// consistent with the RowSeeker contract.
+func TestPageRangeRowsClose(t *testing.T) {
+	rowGroups := []RowGroup{
+		newPageIndexMergeTestRowGroup(t, 0, 0),
+		newPageIndexMergeTestRowGroup(t, 500, 1),
 	}
-
-	if err := reader.Close(); err != nil {
+	merged, err := MergeRowGroups(rowGroups, SortingRowGroupConfig(SortingColumns(Ascending("key"))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageMerge, ok := merged.(*mergedRowGroup)
+	if !ok {
+		t.Fatalf("merged row group type: %T", merged)
+	}
+	rows, ok := newPageRangeRows(pageMerge)
+	if !ok {
+		t.Fatal("page-range direct path unavailable")
+	}
+	if err := rows.Close(); err != nil {
 		t.Fatal(err)
 	}
 	for _, rowIndex := range []int64{0, 1} {
-		if err := reader.SeekToRow(rowIndex); err != io.ErrClosedPipe {
+		if err := rows.SeekToRow(rowIndex); err != io.ErrClosedPipe {
 			t.Fatalf("seek to row %d after close: got %v, want %v", rowIndex, err, io.ErrClosedPipe)
 		}
 	}
-	if n, err := reader.ReadRows(make([]Row, 1)); n != 0 || err != io.EOF {
+	if n, err := rows.ReadRows(make([]Row, 1)); n != 0 || err != io.EOF {
 		t.Fatalf("read after close: got (%d, %v), want (0, %v)", n, err, io.EOF)
 	}
+}
+
+type pageIndexMergeTestRow struct {
+	Key    int64 `parquet:"key"`
+	Source int32 `parquet:"source"`
+}
+
+type withoutPageIndexRowGroup struct{ RowGroup }
+
+func (g withoutPageIndexRowGroup) ColumnChunks() []ColumnChunk {
+	chunks := append([]ColumnChunk(nil), g.RowGroup.ColumnChunks()...)
+	chunks[0] = withoutPageIndexColumnChunk{ColumnChunk: chunks[0]}
+	return chunks
+}
+
+type withoutPageIndexColumnChunk struct{ ColumnChunk }
+
+func (withoutPageIndexColumnChunk) ColumnIndex() (ColumnIndex, error) {
+	return nil, ErrMissingColumnIndex
+}
+
+// rowsDecoratingRowGroup retains the wrapped file metadata but substitutes a
+// different, still source-sorted Rows stream. It models a legal application
+// RowGroup decorator whose ColumnChunks alone cannot authorize direct output.
+type rowsDecoratingRowGroup struct {
+	RowGroup
+	rows RowGroup
+}
+
+func (g rowsDecoratingRowGroup) Rows() Rows { return g.rows.Rows() }
+
+func TestPageIndexMergeRejectsRowsDecorator(t *testing.T) {
+	metadata := pageIndexMergeTestRowGroups(t)
+	assertPageIndexPlanHasDirectComponent(t, metadata)
+
+	decorated := rowsDecoratingRowGroup{
+		RowGroup: metadata[1],
+		rows: newPageIndexMergeTestRowGroupWithKeys(t,
+			append(int64Range(15, 25), int64Range(30, 40)...), 1),
+	}
+	if chunkTransparentRowGroup(decorated) {
+		t.Fatal("Rows decorator unexpectedly marked chunk-transparent")
+	}
+
+	options := []RowGroupOption{SortingRowGroupConfig(SortingColumns(Ascending("key")))}
+	got := mergeRowsForTest(t, []RowGroup{metadata[0], decorated}, options)
+	want := mergeRowsForTest(t, []RowGroup{
+		withoutPageIndexRowGroup{RowGroup: metadata[0]},
+		decorated,
+	}, options)
+	if len(got) != len(want) {
+		t.Fatalf("row count: got %d, want %d", len(got), len(want))
+	}
+	for i := range got {
+		if !got[i].Equal(want[i]) {
+			t.Fatalf("row %d: got %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestPageIndexMergeRejectsForgedBounds(t *testing.T) {
+	for _, dropDuplicatedRows := range []bool{false, true} {
+		t.Run(fmt.Sprintf("drop_duplicates=%t", dropDuplicatedRows), func(t *testing.T) {
+			forged := pageIndexMergeTestRowGroups(t)
+			forgeFirstPageMinimum(t, forged)
+			assertForgedBoundsNeedRowMerge(t, forged)
+
+			options := []RowGroupOption{
+				SortingRowGroupConfig(
+					SortingColumns(Ascending("key")),
+					DropDuplicatedRows(dropDuplicatedRows),
+				),
+			}
+			got := mergeRowsForTest(t, forged, options)
+
+			control := pageIndexMergeTestRowGroups(t)
+			control[0] = withoutPageIndexRowGroup{RowGroup: control[0]}
+			want := mergeRowsForTest(t, control, options)
+			if len(got) != len(want) {
+				t.Fatalf("row count: got %d, want %d", len(got), len(want))
+			}
+			for i := range got {
+				if !got[i].Equal(want[i]) {
+					t.Fatalf("row %d: got %v, want %v", i, got[i], want[i])
+				}
+			}
+		})
+	}
+}
+
+func pageIndexMergeTestRowGroups(t *testing.T) []RowGroup {
+	t.Helper()
+	return []RowGroup{
+		newPageIndexMergeTestRowGroupWithKeys(t, append(int64Range(0, 10), int64Range(20, 30)...), 0),
+		newPageIndexMergeTestRowGroupWithKeys(t, append(int64Range(5, 15), int64Range(30, 40)...), 1),
+	}
+}
+
+func int64Range(start, end int64) []int64 {
+	values := make([]int64, end-start)
+	for i := range values {
+		values[i] = start + int64(i)
+	}
+	return values
+}
+
+func newPageIndexMergeTestRowGroup(t *testing.T, start int64, source int32) RowGroup {
+	t.Helper()
+	return newPageIndexMergeTestRowGroupWithKeys(t, int64Range(start, start+512), source)
+}
+
+func newPageIndexMergeTestRowGroupWithKeys(t *testing.T, keys []int64, source int32) RowGroup {
+	t.Helper()
+	var data bytes.Buffer
+	writer := NewGenericWriter[pageIndexMergeTestRow](
+		&data,
+		PageBufferSize(80),
+		ColumnIndexSizeLimit(func([]string) int { return 1 << 20 }),
+		SortingWriterConfig(SortingColumns(Ascending("key"))),
+	)
+	for _, key := range keys {
+		if _, err := writer.Write([]pageIndexMergeTestRow{{Key: key, Source: source}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := bytes.NewReader(data.Bytes())
+	file, err := OpenFile(reader, reader.Size())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return file.RowGroups()[0]
+}
+
+func assertPageIndexPlanHasDirectComponent(t *testing.T, rowGroups []RowGroup) {
+	t.Helper()
+	sortingColumn := Ascending("key")
+	left, columnType, ok := pageMergeRangesOf(rowGroups[0], rowGroups[0].Schema(), sortingColumn)
+	if !ok {
+		t.Fatal("left index plan unavailable")
+	}
+	right, _, ok := pageMergeRangesOf(rowGroups[1], rowGroups[1].Schema(), sortingColumn)
+	if !ok {
+		t.Fatal("right index plan unavailable")
+	}
+	if _, ok := pageMergePlanOf(left, right, columnType); !ok {
+		t.Fatal("page index did not select a direct component")
+	}
+}
+
+func assertForgedBoundsNeedRowMerge(t *testing.T, rowGroups []RowGroup) {
+	t.Helper()
+	sortingColumn := Ascending("key")
+	left, columnType, ok := pageMergeRangesOf(rowGroups[0], rowGroups[0].Schema(), sortingColumn)
+	if !ok {
+		t.Fatal("left index plan unavailable")
+	}
+	right, _, ok := pageMergeRangesOf(rowGroups[1], rowGroups[1].Schema(), sortingColumn)
+	if !ok {
+		t.Fatal("right index plan unavailable")
+	}
+	plan, ok := pageMergePlanOf(left, right, columnType)
+	if !ok {
+		t.Fatal("forged index did not select a direct component")
+	}
+	if verifyPageMergePlan(rowGroups, rowGroups[0].Schema(), sortingColumn, columnType, plan) {
+		t.Fatal("decoded boundaries accepted forged page-index bounds")
+	}
+}
+
+func forgeFirstPageMinimum(t *testing.T, rowGroups []RowGroup) {
+	t.Helper()
+	leftIndex, err := rowGroups[0].ColumnChunks()[0].ColumnIndex()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightChunk, ok := rowGroups[1].ColumnChunks()[0].(*FileColumnChunk)
+	if !ok {
+		t.Fatalf("column chunk type: %T", rowGroups[1].ColumnChunks()[0])
+	}
+	rightIndex := rightChunk.columnIndex.Load()
+	if rightIndex == nil || leftIndex.NumPages() != 2 || rightIndex.NumPages() != 2 {
+		t.Fatal("expected two-page indexes")
+	}
+
+	// These source-sorted pages are [0..9], [20..29] and [5..14], [30..39].
+	// Forging the second source's first minimum from 5 to 10 makes the index
+	// planner select it after [0..9], although its decoded first value is 5.
+	minimum := int64(10)
+	if leftIndex.MaxValue(0).Int64() != 9 || rightIndex.MinValue(0).Int64() != 5 || rightIndex.MaxValue(0).Int64() != 14 {
+		t.Fatalf("unexpected first-page bounds: left max=%d, right=[%d,%d]", leftIndex.MaxValue(0).Int64(), rightIndex.MinValue(0).Int64(), rightIndex.MaxValue(0).Int64())
+	}
+	rightIndex.index.MinValues[0] = append([]byte(nil), ValueOf(minimum).Bytes()...)
+}
+
+func mergeRowsForTest(t *testing.T, rowGroups []RowGroup, options []RowGroupOption) []Row {
+	t.Helper()
+	merged, err := MergeRowGroups(rowGroups, options...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := merged.Rows()
+	defer rows.Close()
+	return drainMerged(t, rows)
 }
 
 // TestMergedRowReaderRunDetection verifies that run detection produces exactly

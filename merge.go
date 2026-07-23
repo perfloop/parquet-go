@@ -335,10 +335,25 @@ type pageMergeSegment struct {
 }
 
 func newPageRangeRows(m *mergedRowGroup) (Rows, bool) {
-	if len(m.rowGroups) != 2 || len(m.sorting) == 0 {
+	if len(m.rowGroups) != 2 || len(m.sorting) != 1 {
+		return nil, false
+	}
+
+	sortingColumn := m.sorting[0]
+	// The direct-path proof is intentionally narrow: one required ascending
+	// INT64 key. Other sort directions, key types, and composite comparisons
+	// retain the established row-level merge until they have their own evidence.
+	if sortingColumn.Descending() || sortingColumn.NullsFirst() {
 		return nil, false
 	}
 	for _, rowGroup := range m.rowGroups {
+		// The plan validates file-column values but emits Rows(). Only the
+		// package-private marker can attest that those are the same stream; an
+		// application-defined RowGroup may decorate Rows while exposing unchanged
+		// ColumnChunks, so it must retain the established row-level merge.
+		if !chunkTransparentRowGroup(rowGroup) {
+			return nil, false
+		}
 		// Page statistics describe the source values. A converted row group may
 		// transform the sorting value or its levels, so retain the established
 		// row-level merge unless its conversion can be proved separately.
@@ -347,18 +362,20 @@ func newPageRangeRows(m *mergedRowGroup) (Rows, bool) {
 		}
 	}
 
-	sortingColumn := m.sorting[0]
 	ranges0, columnType, ok := pageMergeRangesOf(m.rowGroups[0], m.schema, sortingColumn)
 	if !ok {
 		return nil, false
 	}
 	ranges1, _, ok := pageMergeRangesOf(m.rowGroups[1], m.schema, sortingColumn)
-	if !ok {
+	if !ok || columnType.Kind() != Int64 {
 		return nil, false
 	}
 
-	plan, ok := pageMergePlanOf(ranges0, ranges1, columnType, sortingColumn.Descending())
-	if !ok {
+	// The index plan is only an eligibility hint. Its bounds are file metadata,
+	// so direct output is authorized only after the decoded key values at every
+	// component boundary prove the same strict source ordering.
+	plan, ok := pageMergePlanOf(ranges0, ranges1, columnType)
+	if !ok || !verifyPageMergePlan(m.rowGroups, m.schema, sortingColumn, columnType, plan) {
 		return nil, false
 	}
 
@@ -397,6 +414,10 @@ func pageMergeRangesOf(rowGroup RowGroup, schema *Schema, sortingColumn SortingC
 		return nil, nil, false
 	}
 	chunk := chunks[leaf.ColumnIndex]
+	fileChunk, ok := chunk.(*FileColumnChunk)
+	if !ok || fileChunk.columnIndex.Load() == nil || fileChunk.offsetIndex.Load() == nil {
+		return nil, nil, false
+	}
 
 	columnIndex, err := chunk.ColumnIndex()
 	if err != nil {
@@ -411,11 +432,7 @@ func pageMergeRangesOf(rowGroup RowGroup, schema *Schema, sortingColumn SortingC
 	if numPages == 0 || numPages != offsetIndex.NumPages() {
 		return nil, nil, false
 	}
-	if sortingColumn.Descending() {
-		if !columnIndex.IsDescending() {
-			return nil, nil, false
-		}
-	} else if !columnIndex.IsAscending() {
+	if !columnIndex.IsAscending() {
 		return nil, nil, false
 	}
 
@@ -432,13 +449,10 @@ func pageMergeRangesOf(rowGroup RowGroup, schema *Schema, sortingColumn SortingC
 		}
 
 		min, max := columnIndex.MinValue(i), columnIndex.MaxValue(i)
-		if sortingColumn.Descending() {
-			min, max = max, min
-		}
-		if min.IsNull() || max.IsNull() || compareValues(min, max, columnType, sortingColumn.Descending()) > 0 {
+		if min.IsNull() || max.IsNull() || columnType.Compare(min, max) > 0 {
 			return nil, nil, false
 		}
-		if i > 0 && compareValues(ranges[i-1].max, min, columnType, sortingColumn.Descending()) > 0 {
+		if i > 0 && columnType.Compare(ranges[i-1].max, min) > 0 {
 			return nil, nil, false
 		}
 		ranges[i] = pageMergeRange{
@@ -455,14 +469,159 @@ func pageMergeRangesOf(rowGroup RowGroup, schema *Schema, sortingColumn SortingC
 	return ranges, columnType, true
 }
 
+// verifyPageMergePlan checks every planned component boundary against decoded
+// key values. The existing merger already relies on each input advertising a
+// sorted order; checking the last value of the left component and first value
+// of the right component is therefore sufficient to prove their concatenation
+// is strictly ordered without trusting the page-index bounds that suggested it.
+func verifyPageMergePlan(rowGroups []RowGroup, schema *Schema, sortingColumn SortingColumn, columnType Type, plan []pageMergeSegment) bool {
+	positions := [2][]int64{}
+	for i := 0; i+1 < len(plan); i++ {
+		for _, entry := range pageMergeSegmentRanges(plan[i]) {
+			positions[entry.source] = append(positions[entry.source], entry.range_.last-1)
+		}
+		for _, entry := range pageMergeSegmentRanges(plan[i+1]) {
+			positions[entry.source] = append(positions[entry.source], entry.range_.first)
+		}
+	}
+
+	values := [2]map[int64]Value{}
+	for source := range values {
+		values[source] = decodedPageValuesAt(rowGroups[source], schema, sortingColumn, positions[source])
+		if values[source] == nil {
+			return false
+		}
+	}
+
+	compare := columnType.Compare
+	for i := 0; i+1 < len(plan); i++ {
+		max, ok := pageMergeSegmentMax(plan[i], values, compare)
+		if !ok {
+			return false
+		}
+		min, ok := pageMergeSegmentMin(plan[i+1], values, compare)
+		if !ok || compare(max, min) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func pageMergeSegmentRanges(segment pageMergeSegment) []struct {
+	source int
+	range_ pageMergeRange
+} {
+	if segment.direct >= 0 {
+		return []struct {
+			source int
+			range_ pageMergeRange
+		}{{source: segment.direct, range_: segment.ranges[segment.direct]}}
+	}
+	return []struct {
+		source int
+		range_ pageMergeRange
+	}{
+		{source: 0, range_: segment.ranges[0]},
+		{source: 1, range_: segment.ranges[1]},
+	}
+}
+
+func pageMergeSegmentMax(segment pageMergeSegment, values [2]map[int64]Value, compare func(Value, Value) int) (Value, bool) {
+	var max Value
+	haveValue := false
+	for _, entry := range pageMergeSegmentRanges(segment) {
+		value, ok := values[entry.source][entry.range_.last-1]
+		if !ok {
+			return Value{}, false
+		}
+		if !haveValue || compare(value, max) > 0 {
+			max = value
+			haveValue = true
+		}
+	}
+	return max, haveValue
+}
+
+func pageMergeSegmentMin(segment pageMergeSegment, values [2]map[int64]Value, compare func(Value, Value) int) (Value, bool) {
+	var min Value
+	haveValue := false
+	for _, entry := range pageMergeSegmentRanges(segment) {
+		value, ok := values[entry.source][entry.range_.first]
+		if !ok {
+			return Value{}, false
+		}
+		if !haveValue || compare(value, min) < 0 {
+			min = value
+			haveValue = true
+		}
+	}
+	return min, haveValue
+}
+
+// decodedPageValuesAt reads only the requested logical row positions from the
+// leading required column. It deliberately walks pages in order instead of
+// using an OffsetIndex, because this validation is the integrity boundary for
+// page-index-guided direct output.
+func decodedPageValuesAt(rowGroup RowGroup, schema *Schema, sortingColumn SortingColumn, positions []int64) map[int64]Value {
+	if len(positions) == 0 || sortingColumn.NullsFirst() {
+		return map[int64]Value{}
+	}
+
+	leaf, ok := schema.Lookup(sortingColumn.Path()...)
+	if !ok || leaf.MaxRepetitionLevel != 0 || leaf.MaxDefinitionLevel != 0 {
+		return nil
+	}
+	chunks := rowGroup.ColumnChunks()
+	if leaf.ColumnIndex < 0 || leaf.ColumnIndex >= len(chunks) || !EqualTypes(chunks[leaf.ColumnIndex].Type(), leaf.Node.Type()) {
+		return nil
+	}
+
+	slices.Sort(positions)
+	values := make(map[int64]Value, len(positions))
+	pages := chunks[leaf.ColumnIndex].Pages()
+	defer pages.Close()
+
+	var buffer [128]Value
+	rowIndex := int64(0)
+	positionIndex := 0
+	for positionIndex < len(positions) {
+		page, err := pages.ReadPage()
+		if err != nil {
+			return nil
+		}
+		reader := page.Values()
+		for {
+			n, err := reader.ReadValues(buffer[:])
+			for _, value := range buffer[:n] {
+				if value.IsNull() || value.RepetitionLevel() != 0 || value.DefinitionLevel() != 0 {
+					Release(page)
+					return nil
+				}
+				for positionIndex < len(positions) && positions[positionIndex] == rowIndex {
+					values[rowIndex] = value.Clone()
+					positionIndex++
+				}
+				rowIndex++
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil || n == 0 {
+				Release(page)
+				return nil
+			}
+		}
+		Release(page)
+	}
+	return values
+}
+
 // pageMergePlanOf finds connected components of the two streams of page value
 // intervals. Strictly ordered components can be copied from one source without
 // decoding rows from the other; equal bounds stay in a merged component so
 // sorting-column ties retain the normal row-level ordering.
-func pageMergePlanOf(ranges0, ranges1 []pageMergeRange, columnType Type, descending bool) ([]pageMergeSegment, bool) {
-	compare := func(a, b Value) int {
-		return compareValues(a, b, columnType, descending)
-	}
+func pageMergePlanOf(ranges0, ranges1 []pageMergeRange, columnType Type) ([]pageMergeSegment, bool) {
+	compare := columnType.Compare
 
 	plan := make([]pageMergeSegment, 0, len(ranges0)+len(ranges1))
 	direct := false
@@ -767,9 +926,6 @@ func (c *concatenatingRowsWrapper) ReadRows(rows []Row) (int, error) {
 }
 
 func (c *concatenatingRowsWrapper) Close() (lastErr error) {
-	if c.closed {
-		return nil
-	}
 	c.closed = true
 	for _, r := range c.readers {
 		if err := r.Close(); err != nil {
