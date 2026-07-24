@@ -129,14 +129,7 @@ func (buf *GenericBuffer[T]) Write(rows []T) (int, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
-	if err := buf.base.validateColumnBuffers(); err != nil {
-		return 0, err
-	}
-	n, err := buf.write(buf, rows)
-	if err == nil {
-		buf.base.syncColumnChunks()
-	}
-	return n, err
+	return buf.write(buf, rows)
 }
 
 func (buf *GenericBuffer[T]) WriteRows(rows []Row) (int, error) {
@@ -203,7 +196,6 @@ type Buffer struct {
 	columns               []ColumnBuffer
 	sorted                []bufferSortingColumn
 	directByteArraySchema bool
-	columnBuffersExposed  bool
 }
 
 type bufferSortingColumn struct {
@@ -328,9 +320,6 @@ func (buf *Buffer) NumRows() int64 { return int64(buf.Len()) }
 
 // ColumnChunks returns the buffer columns.
 func (buf *Buffer) ColumnChunks() []ColumnChunk {
-	if buf.validateColumnBuffers() == nil {
-		buf.syncColumnChunks()
-	}
 	return buf.chunks
 }
 
@@ -341,14 +330,10 @@ func (buf *Buffer) ColumnChunks() []ColumnChunk {
 // ColumnBuffers or ColumnChunks with the same index returns the same underlying
 // objects, but with different types, which removes the need for making a type
 // assertion if the program needed to write directly to the column buffers.
-// A caller replacing an entry in the returned slice must preserve the column
-// identity, use a buffer compatible with that schema column, and retain the
-// existing row alignment. The presence of the ColumnChunks method is still
-// required to satisfy the RowGroup interface.
-func (buf *Buffer) ColumnBuffers() []ColumnBuffer {
-	buf.columnBuffersExposed = true
-	return buf.columns
-}
+// The returned slice is a view of fixed buffer slots: callers may write through
+// its elements but must not replace an element. The presence of the ColumnChunks
+// method is still required to satisfy the RowGroup interface.
+func (buf *Buffer) ColumnBuffers() []ColumnBuffer { return buf.columns }
 
 // Schema returns the schema of the buffer.
 //
@@ -367,9 +352,6 @@ func (buf *Buffer) SortingColumns() []SortingColumn { return buf.config.Sorting.
 func (buf *Buffer) Len() int {
 	if len(buf.columns) == 0 {
 		return 0
-	}
-	if buf.validateColumnBuffers() != nil {
-		return buf.chunks[0].(ColumnBuffer).Len()
 	}
 	// All columns have the same number of rows.
 	return buf.columns[0].Len()
@@ -405,7 +387,6 @@ func (buf *Buffer) Reset() {
 	for _, col := range buf.columns {
 		col.Reset()
 	}
-	buf.syncColumnChunks()
 }
 
 // Write writes a row held in a Go value to the buffer.
@@ -436,13 +417,8 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	if buf.schema == nil {
 		return 0, ErrRowGroupSchemaMissing
 	}
-	if err := buf.validateColumnBuffers(); err != nil {
-		return 0, err
-	}
-
 	written, ok := buf.writeRowsByteArrays(rows)
 	if ok {
-		buf.syncColumnChunks()
 		return written, nil
 	}
 	rows = rows[written:]
@@ -464,42 +440,13 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 		}
 	}
 
-	buf.syncColumnChunks()
 	return numRows, nil
-}
-
-func (buf *Buffer) validateColumnBuffers() error {
-	if buf.columnBuffersExposed {
-		for columnIndex, column := range buf.columns {
-			chunk, ok := buf.chunks[columnIndex].(ColumnBuffer)
-			if !ok || column.Column() != columnIndex || column.Len() != chunk.Len() {
-				return ErrRowGroupSchemaMismatch
-			}
-		}
-	}
-	return nil
-}
-
-func (buf *Buffer) syncColumnChunks() {
-	if buf.columnBuffersExposed {
-		for i, column := range buf.columns {
-			buf.chunks[i] = column
-		}
-	}
 }
 
 func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
 	if !buf.directByteArraySchema {
 		return 0, false
 	}
-	if buf.columnBuffersExposed {
-		for _, column := range buf.columns {
-			if _, ok := column.(*byteArrayColumnBuffer); !ok {
-				return 0, false
-			}
-		}
-	}
-
 	if len(rows) > 0 && !isCanonicalRow(rows[0], len(buf.columns)) {
 		return 0, false
 	}

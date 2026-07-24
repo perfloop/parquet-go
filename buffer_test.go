@@ -493,12 +493,79 @@ func TestBuffer(t *testing.T) {
 		})
 	}
 
-	t.Run("write_rows_current_column_buffers", testBufferWriteRowsUsesCurrentColumnBuffers)
-	t.Run("write_rows_current_column_buffers_sorting", testBufferWriteRowsSortsCurrentColumnBuffers)
-	t.Run("write_rows_rejects_mismatched_column_buffers", testBufferWriteRowsRejectsMismatchedColumnBuffers)
-	t.Run("write_rows_rejects_mismatched_optional_column_buffers", testBufferWriteRowsRejectsMismatchedOptionalColumnBuffers)
-	t.Run("write_rows_rejects_unaligned_column_buffers", testBufferWriteRowsRejectsUnalignedColumnBuffers)
-	t.Run("generic_write_rejects_mismatched_column_buffers", testGenericBufferWriteRejectsMismatchedColumnBuffers)
+	t.Run("write_rows_after_rows", testBufferWriteRowsAfterRows)
+}
+
+func testBufferWriteRowsAfterRows(t *testing.T) {
+	schema := parquet.NewSchema("buffer", parquet.Group{
+		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
+		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
+	})
+	rows := []parquet.Row{
+		{
+			parquet.ValueOf([]byte("first")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("one")).Level(0, 0, 1),
+		},
+		{
+			parquet.ValueOf([]byte("second")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("two-two")).Level(0, 0, 1),
+		},
+		{
+			parquet.ValueOf([]byte("third-three")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("three")).Level(0, 0, 1),
+		},
+		{
+			parquet.ValueOf([]byte("fourth")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("four-four")).Level(0, 0, 1),
+		},
+		{
+			parquet.ValueOf([]byte("fifth-five")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("five")).Level(0, 0, 1),
+		},
+	}
+	buffer := parquet.NewBuffer(schema)
+	if n, err := buffer.WriteRows(rows[:1]); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("WriteRows wrote %d rows, want 1", n)
+	}
+	checkBufferRows(t, buffer, rows[:1])
+
+	if n, err := buffer.WriteRows(rows[1:3]); err != nil {
+		t.Fatal(err)
+	} else if n != 2 {
+		t.Fatalf("WriteRows wrote %d rows, want 2", n)
+	}
+	checkBufferRows(t, buffer, rows[:3])
+
+	swapped := parquet.Row{rows[4][1], rows[4][0]}
+	if n, err := buffer.WriteRows([]parquet.Row{rows[3], swapped}); err != nil {
+		t.Fatal(err)
+	} else if n != 2 {
+		t.Fatalf("WriteRows wrote %d rows, want 2", n)
+	}
+	checkBufferRows(t, buffer, rows)
+}
+
+func checkBufferRows(t *testing.T, buffer *parquet.Buffer, want []parquet.Row) {
+	t.Helper()
+	reader := buffer.Rows()
+	got := make([]parquet.Row, len(want))
+	n, err := reader.ReadRows(got)
+	if closeErr := reader.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if n != len(want) {
+		t.Fatalf("Rows read %d rows, want %d", n, len(want))
+	}
+	for i := range want {
+		if !got[i].Equal(want[i]) {
+			t.Fatalf("row %d mismatch:\n got: %#v\nwant: %#v", i, got[i], want[i])
+		}
+	}
 }
 
 type sortFunc func(parquet.Type, []parquet.Value)
@@ -921,222 +988,6 @@ func TestOptionalDictWriteRowGroup(t *testing.T) {
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func testBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
-	schema := parquet.NewSchema("buffer", parquet.Group{
-		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
-		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
-	})
-	buffer := parquet.NewBuffer(schema)
-	columns := buffer.ColumnBuffers()
-	replacement := columns[0].Clone()
-	columns[0] = replacement
-
-	rows := []parquet.Row{
-		{
-			parquet.ValueOf([]byte("first")).Level(0, 0, 0),
-			parquet.ValueOf([]byte("second")).Level(0, 0, 1),
-		},
-		{
-			parquet.ValueOf([]byte("third")).Level(0, 0, 0),
-			parquet.ValueOf([]byte("fourth")).Level(0, 0, 1),
-		},
-		{
-			parquet.ValueOf([]byte("fifth")).Level(0, 0, 0),
-			parquet.ValueOf([]byte("sixth")).Level(0, 0, 1),
-		},
-	}
-	if n, err := buffer.WriteRows(rows[:1]); err != nil {
-		t.Fatal(err)
-	} else if n != 1 {
-		t.Fatalf("WriteRows wrote %d rows, want 1", n)
-	}
-	if got := replacement.Len(); got != 1 {
-		t.Fatalf("replacement column has %d values, want 1", got)
-	}
-	if got := buffer.NumRows(); got != 1 {
-		t.Fatalf("buffer has %d rows, want 1", got)
-	}
-	checkBufferRows(t, buffer, rows[:1])
-
-	if n, err := buffer.WriteRows(rows[1:]); err != nil {
-		t.Fatal(err)
-	} else if n != len(rows)-1 {
-		t.Fatalf("WriteRows wrote %d rows, want %d", n, len(rows)-1)
-	}
-	checkBufferRows(t, buffer, rows)
-
-	fallback := parquet.Row{
-		parquet.ValueOf([]byte("seventh")).Level(0, 0, 0),
-		parquet.ValueOf([]byte("eighth")).Level(0, 0, 1),
-	}
-	noncanonical := parquet.Row{
-		parquet.ValueOf([]byte("ninth")).Level(0, 0, 0),
-		parquet.ValueOf([]byte("tenth")).Level(0, 0, 1),
-	}
-	swapped := parquet.Row{noncanonical[1], noncanonical[0]}
-	if n, err := buffer.WriteRows([]parquet.Row{fallback, swapped}); err != nil {
-		t.Fatal(err)
-	} else if n != 2 {
-		t.Fatalf("WriteRows wrote %d rows, want 2", n)
-	}
-	checkBufferRows(t, buffer, append(rows, fallback, noncanonical))
-
-	buffer.Reset()
-	if got := buffer.NumRows(); got != 0 {
-		t.Fatalf("buffer has %d rows after Reset, want 0", got)
-	}
-	if n, err := buffer.WriteRows(rows[:1]); err != nil {
-		t.Fatal(err)
-	} else if n != 1 {
-		t.Fatalf("WriteRows wrote %d rows, want 1", n)
-	}
-	checkBufferRows(t, buffer, rows[:1])
-}
-
-func testBufferWriteRowsSortsCurrentColumnBuffers(t *testing.T) {
-	schema := parquet.NewSchema("buffer", parquet.Group{
-		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
-		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
-	})
-	buffer := parquet.NewBuffer(
-		schema,
-		parquet.SortingRowGroupConfig(parquet.SortingColumns(parquet.Ascending("first"))),
-	)
-	columns := buffer.ColumnBuffers()
-	columns[0] = columns[0].Clone()
-
-	rows := []parquet.Row{
-		{
-			parquet.ValueOf([]byte("second")).Level(0, 0, 0),
-			parquet.ValueOf([]byte("two")).Level(0, 0, 1),
-		},
-		{
-			parquet.ValueOf([]byte("first")).Level(0, 0, 0),
-			parquet.ValueOf([]byte("one")).Level(0, 0, 1),
-		},
-	}
-	if n, err := buffer.WriteRows(rows); err != nil {
-		t.Fatal(err)
-	} else if n != len(rows) {
-		t.Fatalf("WriteRows wrote %d rows, want %d", n, len(rows))
-	}
-
-	sort.Sort(buffer)
-	checkBufferRows(t, buffer, []parquet.Row{rows[1], rows[0]})
-}
-
-func testBufferWriteRowsRejectsMismatchedColumnBuffers(t *testing.T) {
-	schema := parquet.NewSchema("buffer", parquet.Group{
-		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
-		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
-	})
-	buffer := parquet.NewBuffer(schema)
-	columns := buffer.ColumnBuffers()
-	columns[0] = columns[1].Clone()
-
-	row := parquet.Row{
-		parquet.ValueOf([]byte("first")).Level(0, 0, 0),
-		parquet.ValueOf([]byte("second")).Level(0, 0, 1),
-	}
-	if n, err := buffer.WriteRows([]parquet.Row{row}); !errors.Is(err, parquet.ErrRowGroupSchemaMismatch) {
-		t.Fatalf("WriteRows returned (%d, %v), want schema mismatch", n, err)
-	} else if n != 0 {
-		t.Fatalf("WriteRows wrote %d rows, want 0", n)
-	}
-}
-
-func testBufferWriteRowsRejectsUnalignedColumnBuffers(t *testing.T) {
-	schema := parquet.NewSchema("buffer", parquet.Group{
-		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
-		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
-	})
-	buffer := parquet.NewBuffer(schema)
-	first := parquet.Row{
-		parquet.ValueOf([]byte("first")).Level(0, 0, 0),
-		parquet.ValueOf([]byte("second")).Level(0, 0, 1),
-	}
-	second := parquet.Row{
-		parquet.ValueOf([]byte("third")).Level(0, 0, 0),
-		parquet.ValueOf([]byte("fourth")).Level(0, 0, 1),
-	}
-	if n, err := buffer.WriteRows([]parquet.Row{first}); err != nil {
-		t.Fatal(err)
-	} else if n != 1 {
-		t.Fatalf("WriteRows wrote %d rows, want 1", n)
-	}
-
-	columns := buffer.ColumnBuffers()
-	replacement := parquet.ByteArrayType.NewColumnBuffer(0, 0)
-	columns[0] = replacement
-	if n, err := buffer.WriteRows([]parquet.Row{second}); !errors.Is(err, parquet.ErrRowGroupSchemaMismatch) {
-		t.Fatalf("WriteRows returned (%d, %v), want schema mismatch", n, err)
-	} else if n != 0 {
-		t.Fatalf("WriteRows wrote %d rows, want 0", n)
-	}
-	if got := replacement.Len(); got != 0 {
-		t.Fatalf("replacement column has %d values, want 0", got)
-	}
-	checkBufferRows(t, buffer, []parquet.Row{first})
-}
-
-func testBufferWriteRowsRejectsMismatchedOptionalColumnBuffers(t *testing.T) {
-	schema := parquet.NewSchema("buffer", parquet.Group{
-		"first":  parquet.Optional(parquet.Leaf(parquet.ByteArrayType)),
-		"second": parquet.Optional(parquet.Leaf(parquet.ByteArrayType)),
-	})
-	buffer := parquet.NewBuffer(schema)
-	columns := buffer.ColumnBuffers()
-	columns[0] = columns[1].Clone()
-
-	row := parquet.Row{
-		parquet.ValueOf([]byte("first")).Level(0, 1, 0),
-		parquet.ValueOf([]byte("second")).Level(0, 1, 1),
-	}
-	if n, err := buffer.WriteRows([]parquet.Row{row}); !errors.Is(err, parquet.ErrRowGroupSchemaMismatch) {
-		t.Fatalf("WriteRows returned (%d, %v), want schema mismatch", n, err)
-	} else if n != 0 {
-		t.Fatalf("WriteRows wrote %d rows, want 0", n)
-	}
-}
-
-func testGenericBufferWriteRejectsMismatchedColumnBuffers(t *testing.T) {
-	type row struct {
-		First  string
-		Second string
-	}
-
-	buffer := parquet.NewGenericBuffer[row]()
-	columns := buffer.ColumnBuffers()
-	columns[0] = columns[1].Clone()
-
-	if n, err := buffer.Write([]row{{First: "first", Second: "second"}}); !errors.Is(err, parquet.ErrRowGroupSchemaMismatch) {
-		t.Fatalf("Write returned (%d, %v), want schema mismatch", n, err)
-	} else if n != 0 {
-		t.Fatalf("Write wrote %d rows, want 0", n)
-	}
-}
-
-func checkBufferRows(t *testing.T, buffer *parquet.Buffer, want []parquet.Row) {
-	t.Helper()
-	reader := buffer.Rows()
-	got := make([]parquet.Row, len(want))
-	n, err := reader.ReadRows(got)
-	if closeErr := reader.Close(); closeErr != nil {
-		t.Fatal(closeErr)
-	}
-	if err != nil && !errors.Is(err, io.EOF) {
-		t.Fatal(err)
-	}
-	if n != len(want) {
-		t.Fatalf("Rows read %d rows, want %d", n, len(want))
-	}
-	for i := range want {
-		if !got[i].Equal(want[i]) {
-			t.Fatalf("row %d mismatch:\n got: %#v\nwant: %#v", i, got[i], want[i])
-		}
 	}
 }
 
