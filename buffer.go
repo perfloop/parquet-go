@@ -188,18 +188,14 @@ var (
 // writing them to a parquet file. Buffer implements sort.Interface as a way
 // to support reordering the rows that have been written to it.
 type Buffer struct {
-	config        *RowGroupConfig
-	schema        *Schema
-	rowbuf        []Row
-	colbuf        [][]Value
-	chunks        []ColumnChunk
-	columns       []ColumnBuffer
-	sorted        []ColumnBuffer
-	writeRowsPlan *bufferWriteRowsPlan
-}
-
-type bufferWriteRowsPlan struct {
-	columns []*byteArrayColumnBuffer
+	config           *RowGroupConfig
+	schema           *Schema
+	rowbuf           []Row
+	colbuf           [][]Value
+	chunks           []ColumnChunk
+	columns          []ColumnBuffer
+	sorted           []ColumnBuffer
+	writeRowsColumns []*byteArrayColumnBuffer
 }
 
 // NewBuffer constructs a new buffer, using the given list of buffer options
@@ -299,15 +295,15 @@ func (buf *Buffer) configure(schema *Schema) {
 		return
 	}
 
-	plan := &bufferWriteRowsPlan{columns: make([]*byteArrayColumnBuffer, len(buf.columns))}
+	columns := make([]*byteArrayColumnBuffer, len(buf.columns))
 	for i, column := range buf.columns {
 		byteArrays, ok := column.(*byteArrayColumnBuffer)
 		if !ok {
 			return
 		}
-		plan.columns[i] = byteArrays
+		columns[i] = byteArrays
 	}
-	buf.writeRowsPlan = plan
+	buf.writeRowsColumns = columns
 }
 
 // Size returns the estimated size of the buffer in memory (in bytes).
@@ -442,8 +438,8 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 }
 
 func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
-	plan := buf.writeRowsPlan
-	if plan == nil {
+	columns := buf.writeRowsColumns
+	if columns == nil {
 		return 0, false
 	}
 
@@ -452,27 +448,27 @@ func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
 		if !ok {
 			return 0, false
 		}
-		plan.columns[i] = byteArrays
+		columns[i] = byteArrays
 	}
 
 	for i, row := range rows {
-		if len(row) != len(plan.columns) {
+		if len(row) != len(columns) {
 			return i, false
 		}
-		for columnIndex := range plan.columns {
+		for columnIndex := range columns {
 			if row[columnIndex].column() != columnIndex {
 				return i, false
 			}
 		}
 
 		if i == 0 {
-			for columnIndex, column := range plan.columns {
+			for columnIndex, column := range columns {
 				column.offsets.Grow(len(rows))
 				column.lengths.Grow(len(rows))
-				column.values.Grow(len(rows) * len(row[columnIndex].byteArray()))
+				column.values.Grow(max(column.typ.EstimateSize(len(rows)), len(row[columnIndex].byteArray())))
 			}
 		}
-		for columnIndex, column := range plan.columns {
+		for columnIndex, column := range columns {
 			column.writeByteArray(columnLevels{}, row[columnIndex].byteArray())
 		}
 	}
