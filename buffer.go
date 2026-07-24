@@ -296,9 +296,6 @@ func (buf *Buffer) configure(schema *Schema) {
 		buf.chunks[i] = column
 	}
 
-	if len(buf.columns) == 0 {
-		return
-	}
 	for _, column := range buf.columns {
 		if _, ok := column.(*byteArrayColumnBuffer); !ok {
 			return
@@ -407,6 +404,13 @@ func (buf *Buffer) Write(row any) error {
 
 // WriteRows writes parquet rows to the buffer.
 func (buf *Buffer) WriteRows(rows []Row) (int, error) {
+	defer func() {
+		for i, colbuf := range buf.colbuf {
+			clearValues(colbuf)
+			buf.colbuf[i] = colbuf[:0]
+		}
+	}()
+
 	if buf.schema == nil {
 		return 0, ErrRowGroupSchemaMissing
 	}
@@ -414,13 +418,6 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	if buf.writeRowsByteArrays(rows) {
 		return len(rows), nil
 	}
-
-	defer func() {
-		for i, colbuf := range buf.colbuf {
-			clearValues(colbuf)
-			buf.colbuf[i] = colbuf[:0]
-		}
-	}()
 
 	for _, row := range rows {
 		for _, value := range row {
@@ -444,7 +441,7 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 
 func (buf *Buffer) writeRowsByteArrays(rows []Row) bool {
 	plan := buf.writeRowsPlan
-	if plan == nil || len(plan.columns) == 0 {
+	if plan == nil {
 		return false
 	}
 

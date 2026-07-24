@@ -175,10 +175,6 @@ func (col *byteArrayColumnBuffer) writeValues(levels columnLevels, rows sparse.A
 
 func (col *byteArrayColumnBuffer) writeRows(rows []Row, columnIndex, totalBytes int) {
 	n := len(rows)
-	if n == 0 {
-		return
-	}
-
 	offsetsStart := col.offsets.Len()
 	lengthsStart := col.lengths.Len()
 	valuesStart := col.values.Len()
