@@ -194,8 +194,13 @@ type Buffer struct {
 	colbuf           [][]Value
 	chunks           []ColumnChunk
 	columns          []ColumnBuffer
-	sorted           []ColumnBuffer
+	sorted           []bufferSortingColumn
 	writeRowsColumns []*byteArrayColumnBuffer
+}
+
+type bufferSortingColumn struct {
+	columnIndex int
+	descending  bool
 }
 
 // NewBuffer constructs a new buffer, using the given list of buffer options
@@ -238,7 +243,7 @@ func (buf *Buffer) configure(schema *Schema) {
 		return
 	}
 	sortingColumns := buf.config.Sorting.SortingColumns
-	buf.sorted = make([]ColumnBuffer, len(sortingColumns))
+	buf.sorted = make([]bufferSortingColumn, len(sortingColumns))
 
 	forEachLeafColumnOf(schema, func(leaf leafColumn) {
 		nullOrdering := nullsGoLast
@@ -273,14 +278,16 @@ func (buf *Buffer) configure(schema *Schema) {
 		buf.columns = append(buf.columns, column)
 
 		if sortingIndex < len(sortingColumns) {
-			if sortingColumns[sortingIndex].Descending() {
-				column = &reversedColumnBuffer{column}
+			buf.sorted[sortingIndex] = bufferSortingColumn{
+				columnIndex: len(buf.columns),
+				descending:  sortingColumns[sortingIndex].Descending(),
 			}
-			buf.sorted[sortingIndex] = column
 		}
 	})
 
-	buf.sorted = slices.DeleteFunc(buf.sorted, func(cb ColumnBuffer) bool { return cb == nil })
+	buf.sorted = slices.DeleteFunc(buf.sorted, func(sorting bufferSortingColumn) bool {
+		return sorting.columnIndex == 0
+	})
 
 	buf.schema = schema
 	buf.rowbuf = make([]Row, 0, 1)
@@ -358,11 +365,16 @@ func (buf *Buffer) Len() int {
 
 // Less returns true if row[i] < row[j] in the buffer.
 func (buf *Buffer) Less(i, j int) bool {
-	for _, col := range buf.sorted {
+	for _, sorting := range buf.sorted {
+		left, right := i, j
+		if sorting.descending {
+			left, right = right, left
+		}
+		column := buf.columns[sorting.columnIndex-1]
 		switch {
-		case col.Less(i, j):
+		case column.Less(left, right):
 			return true
-		case col.Less(j, i):
+		case column.Less(right, left):
 			return false
 		}
 	}
@@ -481,9 +493,10 @@ func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
 				value := row[columnIndex].byteArray()
 				offsets := column.offsets.Slice()
 				lengths := column.lengths.Slice()
-				index := len(offsets) - len(rows) + i - 1
-				offsets[index] = uint32(column.values.Len())
-				lengths[index] = uint32(len(value))
+				offsetIndex := len(offsets) - len(rows) + i - 1
+				lengthIndex := len(lengths) - len(rows) + i - 1
+				offsets[offsetIndex] = uint32(column.values.Len())
+				lengths[lengthIndex] = uint32(len(value))
 				column.values.Append(value...)
 			}
 		}

@@ -124,15 +124,6 @@ func nullsGoLast(column ColumnBuffer, i, j int, maxDefinitionLevel, definitionLe
 	return definitionLevel1 == maxDefinitionLevel && (definitionLevel2 != maxDefinitionLevel || column.Less(i, j))
 }
 
-// reversedColumnBuffer is an adapter of ColumnBuffer which inverses the order
-// in which rows are ordered when the column gets sorted.
-//
-// This type is used when buffers are constructed with sorting columns ordering
-// values in descending order.
-type reversedColumnBuffer struct{ ColumnBuffer }
-
-func (col *reversedColumnBuffer) Less(i, j int) bool { return col.ColumnBuffer.Less(j, i) }
-
 var (
 	_ ColumnBuffer = (*optionalColumnBuffer)(nil)
 	_ ColumnBuffer = (*repeatedColumnBuffer)(nil)

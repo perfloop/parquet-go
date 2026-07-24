@@ -927,11 +927,17 @@ func TestBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
 	replacement := columns[0].Clone()
 	columns[0] = replacement
 
-	row := parquet.Row{
-		parquet.ValueOf([]byte("first")).Level(0, 0, 0),
-		parquet.ValueOf([]byte("second")).Level(0, 0, 1),
+	rows := []parquet.Row{
+		{
+			parquet.ValueOf([]byte("first")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("second")).Level(0, 0, 1),
+		},
+		{
+			parquet.ValueOf([]byte("third")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("fourth")).Level(0, 0, 1),
+		},
 	}
-	if n, err := buffer.WriteRows([]parquet.Row{row}); err != nil {
+	if n, err := buffer.WriteRows(rows[:1]); err != nil {
 		t.Fatal(err)
 	} else if n != 1 {
 		t.Fatalf("WriteRows wrote %d rows, want 1", n)
@@ -942,9 +948,52 @@ func TestBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
 	if got := buffer.NumRows(); got != 1 {
 		t.Fatalf("buffer has %d rows, want 1", got)
 	}
+	checkBufferRows(t, buffer, rows[:1])
 
+	if n, err := buffer.WriteRows(rows[1:]); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("WriteRows wrote %d rows, want 1", n)
+	}
+	checkBufferRows(t, buffer, rows)
+}
+
+func TestBufferWriteRowsSortsCurrentColumnBuffers(t *testing.T) {
+	schema := parquet.NewSchema("buffer", parquet.Group{
+		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
+		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
+	})
+	buffer := parquet.NewBuffer(
+		schema,
+		parquet.SortingRowGroupConfig(parquet.SortingColumns(parquet.Ascending("first"))),
+	)
+	columns := buffer.ColumnBuffers()
+	columns[0] = columns[0].Clone()
+
+	rows := []parquet.Row{
+		{
+			parquet.ValueOf([]byte("second")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("two")).Level(0, 0, 1),
+		},
+		{
+			parquet.ValueOf([]byte("first")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("one")).Level(0, 0, 1),
+		},
+	}
+	if n, err := buffer.WriteRows(rows); err != nil {
+		t.Fatal(err)
+	} else if n != len(rows) {
+		t.Fatalf("WriteRows wrote %d rows, want %d", n, len(rows))
+	}
+
+	sort.Sort(buffer)
+	checkBufferRows(t, buffer, []parquet.Row{rows[1], rows[0]})
+}
+
+func checkBufferRows(t *testing.T, buffer *parquet.Buffer, want []parquet.Row) {
+	t.Helper()
 	reader := buffer.Rows()
-	got := make([]parquet.Row, 1)
+	got := make([]parquet.Row, len(want))
 	n, err := reader.ReadRows(got)
 	if closeErr := reader.Close(); closeErr != nil {
 		t.Fatal(closeErr)
@@ -952,11 +1001,13 @@ func TestBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("Rows read %d rows, want 1", n)
+	if n != len(want) {
+		t.Fatalf("Rows read %d rows, want %d", n, len(want))
 	}
-	if !got[0].Equal(row) {
-		t.Fatalf("row mismatch:\n got: %#v\nwant: %#v", got[0], row)
+	for i := range want {
+		if !got[i].Equal(want[i]) {
+			t.Fatalf("row %d mismatch:\n got: %#v\nwant: %#v", i, got[i], want[i])
+		}
 	}
 }
 
