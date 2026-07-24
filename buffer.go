@@ -129,6 +129,9 @@ func (buf *GenericBuffer[T]) Write(rows []T) (int, error) {
 	if len(rows) == 0 {
 		return 0, nil
 	}
+	if err := buf.base.validateColumnBuffers(); err != nil {
+		return 0, err
+	}
 	return buf.write(buf, rows)
 }
 
@@ -188,13 +191,15 @@ var (
 // writing them to a parquet file. Buffer implements sort.Interface as a way
 // to support reordering the rows that have been written to it.
 type Buffer struct {
-	config  *RowGroupConfig
-	schema  *Schema
-	rowbuf  []Row
-	colbuf  [][]Value
-	chunks  []ColumnChunk
-	columns []ColumnBuffer
-	sorted  []bufferSortingColumn
+	config                *RowGroupConfig
+	schema                *Schema
+	rowbuf                []Row
+	colbuf                [][]Value
+	chunks                []ColumnChunk
+	columns               []ColumnBuffer
+	sorted                []bufferSortingColumn
+	directByteArraySchema bool
+	columnBuffersExposed  bool
 }
 
 type bufferSortingColumn struct {
@@ -288,6 +293,14 @@ func (buf *Buffer) configure(schema *Schema) {
 		return sorting.columnIndex == 0
 	})
 
+	buf.directByteArraySchema = len(buf.columns) > 0
+	for _, column := range buf.columns {
+		if _, ok := column.(*byteArrayColumnBuffer); !ok {
+			buf.directByteArraySchema = false
+			break
+		}
+	}
+
 	buf.schema = schema
 	buf.rowbuf = make([]Row, 0, 1)
 	buf.colbuf = make([][]Value, len(buf.columns))
@@ -321,9 +334,13 @@ func (buf *Buffer) ColumnChunks() []ColumnChunk {
 // ColumnBuffers or ColumnChunks with the same index returns the same underlying
 // objects, but with different types, which removes the need for making a type
 // assertion if the program needed to write directly to the column buffers.
-// The presence of the ColumnChunks method is still required to satisfy the
-// RowGroup interface.
-func (buf *Buffer) ColumnBuffers() []ColumnBuffer { return buf.columns }
+// A caller replacing an entry in the returned slice must preserve the column
+// identity and use a buffer compatible with that schema column. The presence of
+// the ColumnChunks method is still required to satisfy the RowGroup interface.
+func (buf *Buffer) ColumnBuffers() []ColumnBuffer {
+	buf.columnBuffersExposed = true
+	return buf.columns
+}
 
 // Schema returns the schema of the buffer.
 //
@@ -408,6 +425,9 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	if buf.schema == nil {
 		return 0, ErrRowGroupSchemaMissing
 	}
+	if err := buf.validateColumnBuffers(); err != nil {
+		return 0, err
+	}
 
 	written, ok := buf.writeRowsByteArrays(rows)
 	if ok {
@@ -435,13 +455,26 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	return numRows, nil
 }
 
+func (buf *Buffer) validateColumnBuffers() error {
+	if buf.columnBuffersExposed {
+		for columnIndex, column := range buf.columns {
+			if column.Column() != columnIndex {
+				return ErrRowGroupSchemaMismatch
+			}
+		}
+	}
+	return nil
+}
+
 func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
-	if len(buf.columns) == 0 {
+	if !buf.directByteArraySchema {
 		return 0, false
 	}
-	for _, column := range buf.columns {
-		if _, ok := column.(*byteArrayColumnBuffer); !ok {
-			return 0, false
+	if buf.columnBuffersExposed {
+		for _, column := range buf.columns {
+			if _, ok := column.(*byteArrayColumnBuffer); !ok {
+				return 0, false
+			}
 		}
 	}
 
@@ -463,26 +496,23 @@ func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
 		}
 
 		if i == 1 {
-			for columnIndex, column := range buf.columns {
+			for _, column := range buf.columns {
 				byteArrays := column.(*byteArrayColumnBuffer)
 				start := byteArrays.lengths.Len()
 				byteArrays.offsets.Resize(start + len(rows))
 				byteArrays.lengths.Resize(start + len(rows))
-				byteArrays.values.Grow(len(rows[0][columnIndex].byteArray()))
 			}
 		}
-		if i > 0 {
-			row := rows[i-1]
-			for columnIndex, column := range buf.columns {
-				byteArrays := column.(*byteArrayColumnBuffer)
-				value := row[columnIndex].byteArray()
-				offsets := byteArrays.offsets.Slice()
-				lengths := byteArrays.lengths.Slice()
-				index := len(lengths) - len(rows) + i - 1
-				offsets[index] = uint32(byteArrays.values.Len())
-				lengths[index] = uint32(len(value))
-				byteArrays.values.Append(value...)
-			}
+		row := rows[i-1]
+		for columnIndex, column := range buf.columns {
+			byteArrays := column.(*byteArrayColumnBuffer)
+			value := row[columnIndex].byteArray()
+			offsets := byteArrays.offsets.Slice()
+			lengths := byteArrays.lengths.Slice()
+			index := len(lengths) - len(rows) + i - 1
+			offsets[index] = uint32(byteArrays.values.Len())
+			lengths[index] = uint32(len(value))
+			byteArrays.values.Append(value...)
 		}
 	}
 	return len(rows), true

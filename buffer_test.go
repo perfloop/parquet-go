@@ -492,6 +492,12 @@ func TestBuffer(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("write_rows_current_column_buffers", testBufferWriteRowsUsesCurrentColumnBuffers)
+	t.Run("write_rows_current_column_buffers_sorting", testBufferWriteRowsSortsCurrentColumnBuffers)
+	t.Run("write_rows_rejects_mismatched_column_buffers", testBufferWriteRowsRejectsMismatchedColumnBuffers)
+	t.Run("write_rows_rejects_mismatched_optional_column_buffers", testBufferWriteRowsRejectsMismatchedOptionalColumnBuffers)
+	t.Run("generic_write_rejects_mismatched_column_buffers", testGenericBufferWriteRejectsMismatchedColumnBuffers)
 }
 
 type sortFunc func(parquet.Type, []parquet.Value)
@@ -918,6 +924,10 @@ func TestOptionalDictWriteRowGroup(t *testing.T) {
 }
 
 func TestBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
+	testBufferWriteRowsUsesCurrentColumnBuffers(t)
+}
+
+func testBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
 	schema := parquet.NewSchema("buffer", parquet.Group{
 		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
 		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
@@ -979,6 +989,10 @@ func TestBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
 }
 
 func TestBufferWriteRowsSortsCurrentColumnBuffers(t *testing.T) {
+	testBufferWriteRowsSortsCurrentColumnBuffers(t)
+}
+
+func testBufferWriteRowsSortsCurrentColumnBuffers(t *testing.T) {
 	schema := parquet.NewSchema("buffer", parquet.Group{
 		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
 		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
@@ -1008,6 +1022,75 @@ func TestBufferWriteRowsSortsCurrentColumnBuffers(t *testing.T) {
 
 	sort.Sort(buffer)
 	checkBufferRows(t, buffer, []parquet.Row{rows[1], rows[0]})
+}
+
+func TestBufferWriteRowsRejectsMismatchedColumnBuffers(t *testing.T) {
+	testBufferWriteRowsRejectsMismatchedColumnBuffers(t)
+}
+
+func testBufferWriteRowsRejectsMismatchedColumnBuffers(t *testing.T) {
+	schema := parquet.NewSchema("buffer", parquet.Group{
+		"first":  parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
+		"second": parquet.Required(parquet.Leaf(parquet.ByteArrayType)),
+	})
+	buffer := parquet.NewBuffer(schema)
+	columns := buffer.ColumnBuffers()
+	columns[0] = columns[1].Clone()
+
+	row := parquet.Row{
+		parquet.ValueOf([]byte("first")).Level(0, 0, 0),
+		parquet.ValueOf([]byte("second")).Level(0, 0, 1),
+	}
+	if n, err := buffer.WriteRows([]parquet.Row{row}); !errors.Is(err, parquet.ErrRowGroupSchemaMismatch) {
+		t.Fatalf("WriteRows returned (%d, %v), want schema mismatch", n, err)
+	} else if n != 0 {
+		t.Fatalf("WriteRows wrote %d rows, want 0", n)
+	}
+}
+
+func TestBufferWriteRowsRejectsMismatchedOptionalColumnBuffers(t *testing.T) {
+	testBufferWriteRowsRejectsMismatchedOptionalColumnBuffers(t)
+}
+
+func testBufferWriteRowsRejectsMismatchedOptionalColumnBuffers(t *testing.T) {
+	schema := parquet.NewSchema("buffer", parquet.Group{
+		"first":  parquet.Optional(parquet.Leaf(parquet.ByteArrayType)),
+		"second": parquet.Optional(parquet.Leaf(parquet.ByteArrayType)),
+	})
+	buffer := parquet.NewBuffer(schema)
+	columns := buffer.ColumnBuffers()
+	columns[0] = columns[1].Clone()
+
+	row := parquet.Row{
+		parquet.ValueOf([]byte("first")).Level(0, 1, 0),
+		parquet.ValueOf([]byte("second")).Level(0, 1, 1),
+	}
+	if n, err := buffer.WriteRows([]parquet.Row{row}); !errors.Is(err, parquet.ErrRowGroupSchemaMismatch) {
+		t.Fatalf("WriteRows returned (%d, %v), want schema mismatch", n, err)
+	} else if n != 0 {
+		t.Fatalf("WriteRows wrote %d rows, want 0", n)
+	}
+}
+
+func TestGenericBufferWriteRejectsMismatchedColumnBuffers(t *testing.T) {
+	testGenericBufferWriteRejectsMismatchedColumnBuffers(t)
+}
+
+func testGenericBufferWriteRejectsMismatchedColumnBuffers(t *testing.T) {
+	type row struct {
+		First  string
+		Second string
+	}
+
+	buffer := parquet.NewGenericBuffer[row]()
+	columns := buffer.ColumnBuffers()
+	columns[0] = columns[1].Clone()
+
+	if n, err := buffer.Write([]row{{First: "first", Second: "second"}}); !errors.Is(err, parquet.ErrRowGroupSchemaMismatch) {
+		t.Fatalf("Write returned (%d, %v), want schema mismatch", n, err)
+	} else if n != 0 {
+		t.Fatalf("Write wrote %d rows, want 0", n)
+	}
 }
 
 func checkBufferRows(t *testing.T, buffer *parquet.Buffer, want []parquet.Row) {
