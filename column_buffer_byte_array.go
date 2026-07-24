@@ -151,22 +151,21 @@ func (col *byteArrayColumnBuffer) writeValues(levels columnLevels, rows sparse.A
 		totalBytes += len(stringArray.Index(i))
 	}
 
-	offsetsStart := col.offsets.Len()
 	lengthsStart := col.lengths.Len()
 	valuesStart := col.values.Len()
 
-	col.offsets.Resize(offsetsStart + n)
+	col.offsets.Resize(lengthsStart + n)
 	col.lengths.Resize(lengthsStart + n)
 	col.values.Resize(valuesStart + totalBytes)
 
-	offsets := col.offsets.Slice()[:offsetsStart+n]
+	offsets := col.offsets.Slice()[:lengthsStart+n]
 	lengths := col.lengths.Slice()[:lengthsStart+n]
 	values := col.values.Slice()[:valuesStart+totalBytes]
 
 	valueOffset := valuesStart
 	for i := range n {
 		s := stringArray.Index(i)
-		offsets[offsetsStart+i] = uint32(valueOffset)
+		offsets[lengthsStart+i] = uint32(valueOffset)
 		lengths[lengthsStart+i] = uint32(len(s))
 		copy(values[valueOffset:], s)
 		valueOffset += len(s)

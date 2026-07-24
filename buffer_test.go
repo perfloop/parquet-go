@@ -936,6 +936,10 @@ func TestBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
 			parquet.ValueOf([]byte("third")).Level(0, 0, 0),
 			parquet.ValueOf([]byte("fourth")).Level(0, 0, 1),
 		},
+		{
+			parquet.ValueOf([]byte("fifth")).Level(0, 0, 0),
+			parquet.ValueOf([]byte("sixth")).Level(0, 0, 1),
+		},
 	}
 	if n, err := buffer.WriteRows(rows[:1]); err != nil {
 		t.Fatal(err)
@@ -952,10 +956,26 @@ func TestBufferWriteRowsUsesCurrentColumnBuffers(t *testing.T) {
 
 	if n, err := buffer.WriteRows(rows[1:]); err != nil {
 		t.Fatal(err)
-	} else if n != 1 {
-		t.Fatalf("WriteRows wrote %d rows, want 1", n)
+	} else if n != len(rows)-1 {
+		t.Fatalf("WriteRows wrote %d rows, want %d", n, len(rows)-1)
 	}
 	checkBufferRows(t, buffer, rows)
+
+	fallback := parquet.Row{
+		parquet.ValueOf([]byte("seventh")).Level(0, 0, 0),
+		parquet.ValueOf([]byte("eighth")).Level(0, 0, 1),
+	}
+	noncanonical := parquet.Row{
+		parquet.ValueOf([]byte("ninth")).Level(0, 0, 0),
+		parquet.ValueOf([]byte("tenth")).Level(0, 0, 1),
+	}
+	swapped := parquet.Row{noncanonical[1], noncanonical[0]}
+	if n, err := buffer.WriteRows([]parquet.Row{fallback, swapped}); err != nil {
+		t.Fatal(err)
+	} else if n != 2 {
+		t.Fatalf("WriteRows wrote %d rows, want 2", n)
+	}
+	checkBufferRows(t, buffer, append(rows, fallback, noncanonical))
 }
 
 func TestBufferWriteRowsSortsCurrentColumnBuffers(t *testing.T) {

@@ -188,14 +188,13 @@ var (
 // writing them to a parquet file. Buffer implements sort.Interface as a way
 // to support reordering the rows that have been written to it.
 type Buffer struct {
-	config           *RowGroupConfig
-	schema           *Schema
-	rowbuf           []Row
-	colbuf           [][]Value
-	chunks           []ColumnChunk
-	columns          []ColumnBuffer
-	sorted           []bufferSortingColumn
-	writeRowsColumns []*byteArrayColumnBuffer
+	config  *RowGroupConfig
+	schema  *Schema
+	rowbuf  []Row
+	colbuf  [][]Value
+	chunks  []ColumnChunk
+	columns []ColumnBuffer
+	sorted  []bufferSortingColumn
 }
 
 type bufferSortingColumn struct {
@@ -293,20 +292,6 @@ func (buf *Buffer) configure(schema *Schema) {
 	buf.rowbuf = make([]Row, 0, 1)
 	buf.colbuf = make([][]Value, len(buf.columns))
 	buf.chunks = make([]ColumnChunk, len(buf.columns))
-
-	if len(buf.columns) == 0 {
-		return
-	}
-
-	columns := make([]*byteArrayColumnBuffer, len(buf.columns))
-	for i, column := range buf.columns {
-		byteArrays, ok := column.(*byteArrayColumnBuffer)
-		if !ok {
-			return
-		}
-		columns[i] = byteArrays
-	}
-	buf.writeRowsColumns = columns
 }
 
 // Size returns the estimated size of the buffer in memory (in bytes).
@@ -451,53 +436,52 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 }
 
 func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
-	columns := buf.writeRowsColumns
-	if columns == nil {
+	if len(buf.columns) == 0 {
 		return 0, false
 	}
-
-	for i, column := range buf.columns {
-		byteArrays, ok := column.(*byteArrayColumnBuffer)
-		if !ok {
+	for _, column := range buf.columns {
+		if _, ok := column.(*byteArrayColumnBuffer); !ok {
 			return 0, false
 		}
-		columns[i] = byteArrays
 	}
 
-	if len(rows) > 0 && !isCanonicalRow(rows[0], len(columns)) {
+	if len(rows) > 0 && !isCanonicalRow(rows[0], len(buf.columns)) {
 		return 0, false
 	}
 
 	for i := 1; i <= len(rows); i++ {
-		if i < len(rows) && !isCanonicalRow(rows[i], len(columns)) {
+		if i < len(rows) && !isCanonicalRow(rows[i], len(buf.columns)) {
 			written := i - 1
 			if i > 1 {
-				for _, column := range columns {
-					column.offsets.Resize(column.offsets.Len() - len(rows) + written)
-					column.lengths.Resize(column.lengths.Len() - len(rows) + written)
+				for _, column := range buf.columns {
+					byteArrays := column.(*byteArrayColumnBuffer)
+					byteArrays.offsets.Resize(byteArrays.lengths.Len() - len(rows) + written)
+					byteArrays.lengths.Resize(byteArrays.lengths.Len() - len(rows) + written)
 				}
 			}
 			return written, false
 		}
 
 		if i == 1 {
-			for columnIndex, column := range columns {
-				column.offsets.Resize(column.offsets.Len() + len(rows))
-				column.lengths.Resize(column.lengths.Len() + len(rows))
-				column.values.Grow(max(column.typ.EstimateSize(len(rows)), len(rows[0][columnIndex].byteArray())))
+			for columnIndex, column := range buf.columns {
+				byteArrays := column.(*byteArrayColumnBuffer)
+				start := byteArrays.lengths.Len()
+				byteArrays.offsets.Resize(start + len(rows))
+				byteArrays.lengths.Resize(start + len(rows))
+				byteArrays.values.Grow(len(rows[0][columnIndex].byteArray()))
 			}
 		}
 		if i > 0 {
 			row := rows[i-1]
-			for columnIndex, column := range columns {
+			for columnIndex, column := range buf.columns {
+				byteArrays := column.(*byteArrayColumnBuffer)
 				value := row[columnIndex].byteArray()
-				offsets := column.offsets.Slice()
-				lengths := column.lengths.Slice()
-				offsetIndex := len(offsets) - len(rows) + i - 1
-				lengthIndex := len(lengths) - len(rows) + i - 1
-				offsets[offsetIndex] = uint32(column.values.Len())
-				lengths[lengthIndex] = uint32(len(value))
-				column.values.Append(value...)
+				offsets := byteArrays.offsets.Slice()
+				lengths := byteArrays.lengths.Slice()
+				index := len(lengths) - len(rows) + i - 1
+				offsets[index] = uint32(byteArrays.values.Len())
+				lengths[index] = uint32(len(value))
+				byteArrays.values.Append(value...)
 			}
 		}
 	}
