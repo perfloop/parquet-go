@@ -188,13 +188,19 @@ var (
 // writing them to a parquet file. Buffer implements sort.Interface as a way
 // to support reordering the rows that have been written to it.
 type Buffer struct {
-	config  *RowGroupConfig
-	schema  *Schema
-	rowbuf  []Row
-	colbuf  [][]Value
-	chunks  []ColumnChunk
-	columns []ColumnBuffer
-	sorted  []ColumnBuffer
+	config        *RowGroupConfig
+	schema        *Schema
+	rowbuf        []Row
+	colbuf        [][]Value
+	chunks        []ColumnChunk
+	columns       []ColumnBuffer
+	sorted        []ColumnBuffer
+	writeRowsPlan *bufferWriteRowsPlan
+}
+
+type bufferWriteRowsPlan struct {
+	columns []*byteArrayColumnBuffer
+	sizes   []int
 }
 
 // NewBuffer constructs a new buffer, using the given list of buffer options
@@ -289,6 +295,24 @@ func (buf *Buffer) configure(schema *Schema) {
 	for i, column := range buf.columns {
 		buf.chunks[i] = column
 	}
+
+	if len(buf.columns) == 0 {
+		return
+	}
+	for _, column := range buf.columns {
+		if _, ok := column.(*byteArrayColumnBuffer); !ok {
+			return
+		}
+	}
+
+	plan := &bufferWriteRowsPlan{
+		columns: make([]*byteArrayColumnBuffer, len(buf.columns)),
+		sizes:   make([]int, len(buf.columns)),
+	}
+	for i, column := range buf.columns {
+		plan.columns[i] = column.(*byteArrayColumnBuffer)
+	}
+	buf.writeRowsPlan = plan
 }
 
 // Size returns the estimated size of the buffer in memory (in bytes).
@@ -383,16 +407,20 @@ func (buf *Buffer) Write(row any) error {
 
 // WriteRows writes parquet rows to the buffer.
 func (buf *Buffer) WriteRows(rows []Row) (int, error) {
+	if buf.schema == nil {
+		return 0, ErrRowGroupSchemaMissing
+	}
+
+	if buf.writeRowsByteArrays(rows) {
+		return len(rows), nil
+	}
+
 	defer func() {
 		for i, colbuf := range buf.colbuf {
 			clearValues(colbuf)
 			buf.colbuf[i] = colbuf[:0]
 		}
 	}()
-
-	if buf.schema == nil {
-		return 0, ErrRowGroupSchemaMissing
-	}
 
 	for _, row := range rows {
 		for _, value := range row {
@@ -412,6 +440,34 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 	}
 
 	return len(rows), nil
+}
+
+func (buf *Buffer) writeRowsByteArrays(rows []Row) bool {
+	plan := buf.writeRowsPlan
+	if plan == nil || len(plan.columns) == 0 {
+		return false
+	}
+
+	clear(plan.sizes)
+	for i := len(rows); i > 0; {
+		i--
+		row := rows[i]
+		if len(row) != len(plan.columns) {
+			return false
+		}
+		for columnIndex := range plan.columns {
+			value := &row[columnIndex]
+			if value.column() != columnIndex {
+				return false
+			}
+			plan.sizes[columnIndex] += len(value.byteArray())
+		}
+	}
+
+	for columnIndex, column := range plan.columns {
+		column.writeRows(rows, columnIndex, plan.sizes[columnIndex])
+	}
+	return true
 }
 
 // WriteRowGroup satisfies the RowGroupWriter interface.
