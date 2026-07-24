@@ -200,7 +200,6 @@ type Buffer struct {
 
 type bufferWriteRowsPlan struct {
 	columns []*byteArrayColumnBuffer
-	sizes   []int
 }
 
 // NewBuffer constructs a new buffer, using the given list of buffer options
@@ -296,18 +295,17 @@ func (buf *Buffer) configure(schema *Schema) {
 		buf.chunks[i] = column
 	}
 
-	for _, column := range buf.columns {
-		if _, ok := column.(*byteArrayColumnBuffer); !ok {
-			return
-		}
+	if len(buf.columns) == 0 {
+		return
 	}
 
-	plan := &bufferWriteRowsPlan{
-		columns: make([]*byteArrayColumnBuffer, len(buf.columns)),
-		sizes:   make([]int, len(buf.columns)),
-	}
+	plan := &bufferWriteRowsPlan{columns: make([]*byteArrayColumnBuffer, len(buf.columns))}
 	for i, column := range buf.columns {
-		plan.columns[i] = column.(*byteArrayColumnBuffer)
+		byteArrays, ok := column.(*byteArrayColumnBuffer)
+		if !ok {
+			return
+		}
+		plan.columns[i] = byteArrays
 	}
 	buf.writeRowsPlan = plan
 }
@@ -404,6 +402,8 @@ func (buf *Buffer) Write(row any) error {
 
 // WriteRows writes parquet rows to the buffer.
 func (buf *Buffer) WriteRows(rows []Row) (int, error) {
+	numRows := len(rows)
+
 	defer func() {
 		for i, colbuf := range buf.colbuf {
 			clearValues(colbuf)
@@ -415,9 +415,11 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 		return 0, ErrRowGroupSchemaMissing
 	}
 
-	if buf.writeRowsByteArrays(rows) {
-		return len(rows), nil
+	written, ok := buf.writeRowsByteArrays(rows)
+	if ok {
+		return written, nil
 	}
+	rows = rows[written:]
 
 	for _, row := range rows {
 		for _, value := range row {
@@ -436,35 +438,45 @@ func (buf *Buffer) WriteRows(rows []Row) (int, error) {
 		}
 	}
 
-	return len(rows), nil
+	return numRows, nil
 }
 
-func (buf *Buffer) writeRowsByteArrays(rows []Row) bool {
+func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
 	plan := buf.writeRowsPlan
 	if plan == nil {
-		return false
+		return 0, false
 	}
 
-	clear(plan.sizes)
-	for i := len(rows); i > 0; {
-		i--
-		row := rows[i]
+	for i, column := range buf.columns {
+		byteArrays, ok := column.(*byteArrayColumnBuffer)
+		if !ok {
+			return 0, false
+		}
+		plan.columns[i] = byteArrays
+	}
+
+	for i, row := range rows {
 		if len(row) != len(plan.columns) {
-			return false
+			return i, false
 		}
 		for columnIndex := range plan.columns {
-			value := &row[columnIndex]
-			if value.column() != columnIndex {
-				return false
+			if row[columnIndex].column() != columnIndex {
+				return i, false
 			}
-			plan.sizes[columnIndex] += len(value.byteArray())
+		}
+
+		if i == 0 {
+			for columnIndex, column := range plan.columns {
+				column.offsets.Grow(len(rows))
+				column.lengths.Grow(len(rows))
+				column.values.Grow(len(rows) * len(row[columnIndex].byteArray()))
+			}
+		}
+		for columnIndex, column := range plan.columns {
+			column.writeByteArray(columnLevels{}, row[columnIndex].byteArray())
 		}
 	}
-
-	for columnIndex, column := range plan.columns {
-		column.writeRows(rows, columnIndex, plan.sizes[columnIndex])
-	}
-	return true
+	return len(rows), true
 }
 
 // WriteRowGroup satisfies the RowGroupWriter interface.

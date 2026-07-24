@@ -173,30 +173,6 @@ func (col *byteArrayColumnBuffer) writeValues(levels columnLevels, rows sparse.A
 	}
 }
 
-func (col *byteArrayColumnBuffer) writeRows(rows []Row, columnIndex, totalBytes int) {
-	n := len(rows)
-	offsetsStart := col.offsets.Len()
-	lengthsStart := col.lengths.Len()
-	valuesStart := col.values.Len()
-
-	col.offsets.Resize(offsetsStart + n)
-	col.lengths.Resize(lengthsStart + n)
-	col.values.Resize(valuesStart + totalBytes)
-
-	offsets := col.offsets.Slice()[:offsetsStart+n]
-	lengths := col.lengths.Slice()[:lengthsStart+n]
-	values := col.values.Slice()[:valuesStart+totalBytes]
-
-	valueOffset := valuesStart
-	for i := range rows {
-		value := rows[i][columnIndex].byteArray()
-		offsets[offsetsStart+i] = uint32(valueOffset)
-		lengths[lengthsStart+i] = uint32(len(value))
-		copy(values[valueOffset:], value)
-		valueOffset += len(value)
-	}
-}
-
 func (col *byteArrayColumnBuffer) writeBoolean(levels columnLevels, value bool) {
 	offset := col.values.Len()
 	col.values.AppendFunc(func(b []byte) []byte {
