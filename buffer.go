@@ -287,10 +287,6 @@ func (buf *Buffer) configure(schema *Schema) {
 	buf.colbuf = make([][]Value, len(buf.columns))
 	buf.chunks = make([]ColumnChunk, len(buf.columns))
 
-	for i, column := range buf.columns {
-		buf.chunks[i] = column
-	}
-
 	if len(buf.columns) == 0 {
 		return
 	}
@@ -319,7 +315,12 @@ func (buf *Buffer) Size() int64 {
 func (buf *Buffer) NumRows() int64 { return int64(buf.Len()) }
 
 // ColumnChunks returns the buffer columns.
-func (buf *Buffer) ColumnChunks() []ColumnChunk { return buf.chunks }
+func (buf *Buffer) ColumnChunks() []ColumnChunk {
+	for i, column := range buf.columns {
+		buf.chunks[i] = column
+	}
+	return buf.chunks
+}
 
 // ColumnBuffers returns the buffer columns.
 //
@@ -451,28 +452,55 @@ func (buf *Buffer) writeRowsByteArrays(rows []Row) (int, bool) {
 		columns[i] = byteArrays
 	}
 
-	for i, row := range rows {
-		if len(row) != len(columns) {
-			return i, false
-		}
-		for columnIndex := range columns {
-			if row[columnIndex].column() != columnIndex {
-				return i, false
+	if len(rows) > 0 && !isCanonicalRow(rows[0], len(columns)) {
+		return 0, false
+	}
+
+	for i := 1; i <= len(rows); i++ {
+		if i < len(rows) && !isCanonicalRow(rows[i], len(columns)) {
+			written := i - 1
+			if i > 1 {
+				for _, column := range columns {
+					column.offsets.Resize(column.offsets.Len() - len(rows) + written)
+					column.lengths.Resize(column.lengths.Len() - len(rows) + written)
+				}
 			}
+			return written, false
 		}
 
-		if i == 0 {
+		if i == 1 {
 			for columnIndex, column := range columns {
-				column.offsets.Grow(len(rows))
-				column.lengths.Grow(len(rows))
-				column.values.Grow(max(column.typ.EstimateSize(len(rows)), len(row[columnIndex].byteArray())))
+				column.offsets.Resize(column.offsets.Len() + len(rows))
+				column.lengths.Resize(column.lengths.Len() + len(rows))
+				column.values.Grow(max(column.typ.EstimateSize(len(rows)), len(rows[0][columnIndex].byteArray())))
 			}
 		}
-		for columnIndex, column := range columns {
-			column.writeByteArray(columnLevels{}, row[columnIndex].byteArray())
+		if i > 0 {
+			row := rows[i-1]
+			for columnIndex, column := range columns {
+				value := row[columnIndex].byteArray()
+				offsets := column.offsets.Slice()
+				lengths := column.lengths.Slice()
+				index := len(offsets) - len(rows) + i - 1
+				offsets[index] = uint32(column.values.Len())
+				lengths[index] = uint32(len(value))
+				column.values.Append(value...)
+			}
 		}
 	}
 	return len(rows), true
+}
+
+func isCanonicalRow(row Row, numColumns int) bool {
+	if len(row) != numColumns {
+		return false
+	}
+	for columnIndex := range row {
+		if row[columnIndex].column() != columnIndex {
+			return false
+		}
+	}
+	return true
 }
 
 // WriteRowGroup satisfies the RowGroupWriter interface.
